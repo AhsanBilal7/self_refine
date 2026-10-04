@@ -233,9 +233,9 @@ tokens. Critic: 384. Corrector: 1024. Inside prompts, traces longer than
 4000 characters keep their head and tail, and critiques are cut to their first
 1500 characters. The model wrapper truncates prompts to 2048 tokens.
 
-**Answer extraction.** Each trace is cut after its first `\boxed{...}`, and
-`Extract(·)` returns the last `\boxed{}` content, or the last number if no box
-is present. If the corrector returns nothing, g<sup>(d)</sup> is carried
+**Answer extraction.** Traces are stored and passed on in full. `Extract(·)`
+returns the content of the last `\boxed{}` in a trace, or the last number if
+no box is present. If the corrector returns nothing, g<sup>(d)</sup> is carried
 forward as r<sup>(d)</sup>.
 
 **Voting.** Answers are grouped after light normalisation (whitespace and

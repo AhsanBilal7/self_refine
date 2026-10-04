@@ -44,8 +44,8 @@ T_div.model    = string(T_div.model);
 T_div.dataset  = string(T_div.dataset);
 
 % ── Models, styles ────────────────────────────────────────────────────────────
-model_keys = ["LLaMA-3.1-8B", "Ministral-8B", "Qwen2.5-1.5B", "Qwen2.5-Math-7B"];
-model_tex  = {'LLaMA-3.1-8B', 'Ministral-8B', 'Qwen2.5-1.5B', 'Qwen2.5-Math-7B'};
+model_keys = ["LLaMA-3.1-8B", "Ministral-8B", "Qwen2.5-1.5B-Instruct", "Qwen2.5-Math-7B"];
+model_tex  = {'LLaMA-3.1-8B', 'Ministral-8B', 'Qwen2.5-1.5B-Instruct', 'Qwen2.5-Math-7B'};
 
 % Colorblind-safe palette (Wong 2011)
 colors = [

@@ -3,7 +3,7 @@
 Export the refinement-dynamics CSVs used by ``plot_cimr_metrics.m``.
 
 Reads the ``metrics_summary.json`` files written by ``extract_cimr_metrics.py``
-for the four paper models (Qwen2.5-Math-7B, Qwen2.5-1.5B, Ministral-8B,
+for the four paper models (Qwen2.5-Math-7B, Qwen2.5-1.5B-Instruct, Ministral-8B,
 LLaMA-3.1-8B) at N=8, D=4 with the full pipeline (``_no_critique`` files are
 excluded), and writes three tidy CSVs to ``--output_dir``:
 
@@ -40,7 +40,7 @@ from typing import Any, Dict, List
 # Result-folder prefix -> display name used in the CSVs and figures
 MODEL_MAP: Dict[str, str] = {
     "Qwen2.5-Math-7B-Instruct": "Qwen2.5-Math-7B",
-    "Qwen2.5-1.5B-Instruct":    "Qwen2.5-1.5B",
+    "Qwen2.5-1.5B-Instruct":    "Qwen2.5-1.5B-Instruct",
     "Ministral-8B-Instruct":    "Ministral-8B",
     "Llama-3.1-8B-Instruct":    "LLaMA-3.1-8B",
 }

@@ -32,7 +32,7 @@ Usage
     python extract_baseline_flop.py \
         --results_dir experiments_results/results_baselines \
         --output_dir  experiments_results/compute_flops_baseline \
-        [--models "Qwen2.5-Math-7B" "Qwen2.5-1.5B"] [--methods bon bon_majority]
+        [--models "Qwen2.5-Math-7B" "Qwen2.5-1.5B-Instruct"] [--methods bon bon_majority]
 
 Output
 ------
@@ -74,7 +74,7 @@ MODEL_REGISTRY: Dict[str, Tuple[float, str, str]] = {
     # folder-prefix → (params_B, display_name, tiktoken_encoding)
     "Qwen2.5-Math-7B-Instruct":    (7.617, "Qwen2.5-Math-7B", "cl100k_base"),
     "Qwen2.5-Math-7B":             (7.617, "Qwen2.5-Math-7B", "cl100k_base"),
-    "Qwen2.5-1.5B-Instruct":       (1.543, "Qwen2.5-1.5B",    "cl100k_base"),
+    "Qwen2.5-1.5B-Instruct":       (1.543, "Qwen2.5-1.5B-Instruct", "cl100k_base"),
     "Qwen2.5-1.5B":                (1.543, "Qwen2.5-1.5B",    "cl100k_base"),
     "Ministral-8B-Instruct-2410":  (8.030, "Ministral-8B",    "cl100k_base"),
     "Ministral-8B":                (8.030, "Ministral-8B",    "cl100k_base"),

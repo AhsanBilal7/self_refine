@@ -33,7 +33,7 @@ Usage
     python extract_compute_flop.py \
         --results_dir experiments_results/results_paired \
         --output_dir  experiments_results/compute_flops \
-        [--models "Qwen2.5-Math-7B" "Qwen2.5-1.5B"] [--include_no_critique] \
+        [--models "Qwen2.5-Math-7B" "Qwen2.5-1.5B-Instruct"] [--include_no_critique] \
         [--encoding o200k_base]
 
 Output
@@ -90,7 +90,7 @@ MODEL_REGISTRY: Dict[str, Tuple[float, str, str]] = {
     # (params_B, display_name, tiktoken_encoding)
     "Qwen2.5-Math-7B-Instruct":    (7.617, "Qwen2.5-Math-7B", "cl100k_base"),
     "Qwen2.5-Math-7B":             (7.617, "Qwen2.5-Math-7B", "cl100k_base"),
-    "Qwen2.5-1.5B-Instruct":       (1.543, "Qwen2.5-1.5B",    "cl100k_base"),
+    "Qwen2.5-1.5B-Instruct":       (1.543, "Qwen2.5-1.5B-Instruct", "cl100k_base"),
     "Qwen2.5-1.5B":                (1.543, "Qwen2.5-1.5B",    "cl100k_base"),
     "Ministral-8B-Instruct-2410":  (8.030, "Ministral-8B",    "cl100k_base"),
     "Ministral-8B":                (8.030, "Ministral-8B",    "cl100k_base"),

@@ -28,10 +28,10 @@ influence the trace that is carried forward.
 
 Step-record fields (stored in ``cimr_full_results_*.json``)::
 
-    reasoning_response   g_i^(d), cut after its first \\boxed{...}
+    reasoning_response   g_i^(d), the full generator output
     reasoning_answer     Extract(g_i^(d))              (alpha in the appendix)
     critique_response    c_i^(d)  ("" under --no_critique)
-    correction_response  raw corrector output, cut after its first \\boxed{...}
+    correction_response  the full corrector output
     corrected_trace      r_i^(d)  (falls back to g_i^(d) if the corrector
                                    returns nothing or --no_correction is set)
     corrected_answer     Extract(r_i^(d))              (beta in the appendix)
@@ -90,28 +90,6 @@ def extract_boxed(text: str) -> str:
             depth -= 1
         i += 1
     return text[start: i - 1].strip() if depth == 0 else text[start:].strip()
-
-
-def truncate_at_first_boxed(text: str) -> str:
-    """Cut ``text`` right after its first complete ``\\boxed{...}``.
-
-    Removes anything the model writes after committing to an answer.
-    """
-    if not text:
-        return text
-    m = re.search(r"\\boxed\{", text)
-    if not m:
-        return text
-    start = m.end()
-    depth = 1
-    i = start
-    while i < len(text) and depth > 0:
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-        i += 1
-    return text[:i] if depth == 0 else text
 
 
 def extract_answer(text: str) -> str:
@@ -310,7 +288,7 @@ def run_step_batch(
         temperature=config.reasoning_temperature,
         top_p=config.reasoning_top_p,
     )
-    reasoning_cleans = [truncate_at_first_boxed(r or "") for r in reasoning_raws]
+    reasoning_cleans = [r or "" for r in reasoning_raws]
     reasoning_answers = [extract_answer(r) for r in reasoning_cleans]
     reasoning_prms = score_traces_batch(verifier, question, reasoning_cleans, gold_answer)
 
@@ -361,7 +339,7 @@ def run_step_batch(
             max_new_tokens=config.correction_max_tokens,
             do_sample=False,
         )
-        correction_cleans = [truncate_at_first_boxed(r or "") for r in correction_raws]
+        correction_cleans = [r or "" for r in correction_raws]
 
     # The corrector output becomes r^(d) when non-empty; otherwise g^(d) is
     # carried forward so the next depth never starts from a blank trace.
@@ -405,7 +383,6 @@ __all__ = [
     "run_step_batch",
     "extract_answer",
     "extract_boxed",
-    "truncate_at_first_boxed",
     "build_chat_prompt",
     "score_traces_batch",
 ]
