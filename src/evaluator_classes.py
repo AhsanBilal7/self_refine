@@ -1,33 +1,25 @@
-"""
-evaluator_classes.py
---------------------
-Evaluator classes for answer extraction and equivalence checking.
-Ported from the project's Evaluator.py.
+"""Answer extraction and equivalence checking per benchmark family.
 
-Key improvement over plain string equality
--------------------------------------------
-MATHEvaluator._check_answers_equiv uses a four-level strategy:
-  1. Exact string match (case-insensitive)
-  2. Normalised LaTeX match  — strips \\left/\\right, collapses whitespace,
-     normalises comma spacing.  Catches cases like:
-       \\left( \\frac{3}{5}, \\frac{8}{3} \\right]  ==  \\left(\\frac{3}{5},\\frac{8}{3}\\right]
-  3. latex_equiv  (symbolic, via grader.math_equal fallback when unavailable)
-  4. latex_equiv on the normalised forms
+``get_evaluator(task)`` returns one of
+
+* ``MATHEvaluator``     -- MATH-500, AIME, AMC (and the ``custom`` loader),
+* ``OlympiadEvaluator`` -- OlympiadBench,
+* ``GSM8KEvaluator``    -- GSM8K.
+
+``extract_answer_from_model_completion`` reads the last ``\\boxed{}``.
+``check_answers_equiv`` tests equivalence symmetrically through a cascade:
+exact match, whitespace/``\\left``/``\\right``-normalised match, symbolic
+``latex_equiv`` and, for MATH-style answers, numeric closeness.
 """
 
 import re
 from typing import Tuple
 
-# ── latex_equiv with graceful fallback ────────────────────────────────────────
 try:
-    from help_functions.math_toolkit.latex_answer_check import latex_equiv  # type: ignore
-except ImportError:
-    def latex_equiv(a: str, b: str) -> bool:  # type: ignore
-        try:
-            from grader import math_equal  # type: ignore
-            return bool(math_equal(a, b, timeout=True))
-        except Exception:
-            return a.strip() == b.strip()
+    from .math_toolkit.latex_answer_check import latex_equiv
+except ImportError:  # sympy / pyparsing unavailable
+    def latex_equiv(a: str, b: str) -> bool:
+        return a.strip() == b.strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -67,8 +59,7 @@ def _normalise_latex(s: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class Evaluator:
-    def __init__(self, num_last_chars_for_eval=128) -> None:
-        self.num_last_chars_for_eval = num_last_chars_for_eval
+    """Base class; subclasses implement extraction and pairwise equivalence."""
 
     def _is_number(self, s) -> Tuple[bool, str]:
         try:
@@ -131,12 +122,6 @@ class Evaluator:
     def _check_answers_equiv(self, answer_a: str, answer_b: str):
         raise NotImplementedError
 
-    def extract_answer_from_gold_solution(self, solution: str) -> str:
-        return self._extract_answer_from_gold_solution(solution)
-
-    def _extract_answer_from_gold_solution(self, solution: str) -> str:
-        raise NotImplementedError
-
     def extract_answer_from_model_completion(self, completion: str) -> str:
         if not self.validate_model_completion(completion):
             return None
@@ -145,40 +130,13 @@ class Evaluator:
     def _extract_answer_from_model_completion(self, completion: str) -> str:
         raise NotImplementedError
 
-    def find_majority_completion_and_answer(self, candidates):
-        if not candidates:
-            return None, None
-        clusters = []
-        for candidate in candidates:
-            c_ans = self.extract_answer_from_model_completion(
-                candidate[-self.num_last_chars_for_eval:]
-            )
-            placed = False
-            for cluster in clusters:
-                r_ans = self.extract_answer_from_model_completion(
-                    cluster[0][-self.num_last_chars_for_eval:]
-                )
-                if self.check_answers_equiv(c_ans, r_ans):
-                    cluster.append(candidate)
-                    placed = True
-                    break
-            if not placed:
-                clusters.append([candidate])
-        majority_cluster = max(clusters, key=len)
-        majority_completion = majority_cluster[0]
-        majority_answer = self.extract_answer_from_model_completion(
-            majority_completion[-self.num_last_chars_for_eval:]
-        )
-        return majority_completion, majority_answer
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset-specific evaluators
 # ──────────────────────────────────────────────────────────────────────────────
 
 class GSM8KEvaluator(Evaluator):
-    def __init__(self) -> None:
-        super().__init__()
+    """Numeric equality of ``\\boxed{}`` answers."""
 
     def _check_answers_equiv(self, answer_a: str, answer_b: str):
         if answer_a is None or answer_b is None:
@@ -190,17 +148,9 @@ class GSM8KEvaluator(Evaluator):
     def validate_model_completion(self, completion: str) -> bool:
         return isinstance(completion, str) and "\\boxed" in completion
 
-    def _extract_answer_from_gold_solution(self, solution):
-        if isinstance(solution, float):
-            return str(solution)
-        if isinstance(solution, str):
-            return solution.split("#### ")[-1].strip()
-        raise ValueError(f"Unexpected gold solution type: {type(solution)}")
-
     def _extract_answer_from_model_completion(self, completion: str):
         ans = self._remove_boxed(completion)
         return ans if ans else None
-
 
 
 def _numeric_equiv(a: str, b: str, tol: float = 1e-2) -> bool:
@@ -231,9 +181,9 @@ def _numeric_equiv(a: str, b: str, tol: float = 1e-2) -> bool:
         return abs(fa - fb) < tol
     return False
 
+
 class MATHEvaluator(Evaluator):
-    def __init__(self) -> None:
-        super().__init__()
+    """LaTeX-aware equivalence with a numeric fallback (rel. tol. 1e-2)."""
 
     def _check_answers_equiv(self, answer_a: str, answer_b: str):
         if answer_a is None or answer_b is None:
@@ -276,11 +226,6 @@ class MATHEvaluator(Evaluator):
     def validate_model_completion(self, completion: str) -> bool:
         return isinstance(completion, str) and "\\boxed" in completion
 
-    def _extract_answer_from_gold_solution(self, solution: str):
-        box = self._last_boxed_only_string(solution)
-        ans = self._remove_boxed(box)
-        return ans if ans else None
-
     def _extract_answer_from_model_completion(self, completion: str):
         box = self._last_boxed_only_string(completion)
         ans = self._remove_boxed(box)
@@ -288,8 +233,7 @@ class MATHEvaluator(Evaluator):
 
 
 class OlympiadEvaluator(Evaluator):
-    def __init__(self) -> None:
-        super().__init__()
+    """LaTeX-aware equivalence without the numeric fallback."""
 
     def _check_answers_equiv(self, answer_a: str, answer_b: str):
         if answer_a is None or answer_b is None:
@@ -312,9 +256,6 @@ class OlympiadEvaluator(Evaluator):
         except Exception:
             return False
 
-    def _extract_answer_from_gold_solution(self, solution: str):
-        return solution.strip("$")
-
     def _extract_answer_from_model_completion(self, completion: str):
         box = self._last_boxed_only_string(completion)
         ans = self._remove_boxed(box)
@@ -325,223 +266,22 @@ class OlympiadEvaluator(Evaluator):
 # Registry
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Registry
-# ──────────────────────────────────────────────────────────────────────────────
-
-# ── Multiple-choice evaluator (MMLU, ARC-Challenge) ───────────────────────────
-# Gold answer is a single letter A/B/C/D.
-# Model answer is extracted by looking for the last standalone letter
-# A/B/C/D in the completion (inside \boxed{} if present, otherwise raw).
-# Equivalence: exact letter match after normalisation.
-
-class MCQEvaluator(Evaluator):
-    """
-    Evaluator for multiple-choice benchmarks where the gold answer is a
-    single letter (A, B, C, D).
-
-    Used for: MMLU, ARC-Challenge.
-
-    Answer extraction strategy (in priority order):
-      1. Content of \\boxed{} if present.
-      2. Last occurrence of a standalone A/B/C/D/E in the completion.
-      3. First character of the stripped completion if it is a letter.
-    """
-
-    # Letters that are valid single-option answers
-    _VALID = set("ABCDE")
-
-    def _check_answers_equiv(self, answer_a: str, answer_b: str):
-        if answer_a is None or answer_b is None:
-            return None
-        # Normalise both to uppercase letter
-        a = answer_a.strip().upper()
-        b = answer_b.strip().upper()
-        # Strip trailing punctuation (e.g. "A." → "A")
-        a = a.rstrip(".):").strip()
-        b = b.rstrip(".):").strip()
-        if not a or not b:
-            return False
-        return a == b
-
-    def validate_model_completion(self, completion: str) -> bool:
-        # Accept any non-empty string; extraction handles missing \boxed{}
-        return isinstance(completion, str) and len(completion.strip()) > 0
-
-    def _extract_answer_from_gold_solution(self, solution: str) -> str:
-        return solution.strip().upper().rstrip(".):").strip()
-
-    def _extract_answer_from_model_completion(self, completion: str) -> str:
-        if not completion:
-            return ""
-
-        # 1. Try \boxed{} first
-        box = self._last_boxed_only_string(completion)
-        if box:
-            ans = self._remove_boxed(box)
-            if ans:
-                return ans.strip().upper().rstrip(".):").strip()
-
-        # 2. Last standalone letter A-E preceded by whitespace / punctuation
-        import re as _re
-        matches = _re.findall(r'(?<![A-Za-z])([A-E])(?![A-Za-z])', completion.upper())
-        if matches:
-            return matches[-1]
-
-        # 3. First character of stripped completion
-        first = completion.strip()[0].upper()
-        if first in self._VALID:
-            return first
-
-        return completion.strip()[:1].upper()
-
-
-# ── Yes/No evaluator (StrategyQA) ──────────────────────────────────────────────
-# Gold answer is "yes" or "no".  Model answer is extracted by searching
-# for the first occurrence of "yes" or "no" in the completion.
-
-class YesNoEvaluator(Evaluator):
-    """
-    Evaluator for binary yes/no questions.
-
-    Used for: StrategyQA.
-
-    Answer extraction: search for "yes"/"no" (case-insensitive) in the
-    completion, preferring \\boxed{} content first.
-    """
-
-    def _check_answers_equiv(self, answer_a: str, answer_b: str):
-        if answer_a is None or answer_b is None:
-            return None
-        return answer_a.strip().lower() == answer_b.strip().lower()
-
-    def validate_model_completion(self, completion: str) -> bool:
-        return isinstance(completion, str) and len(completion.strip()) > 0
-
-    def _extract_answer_from_gold_solution(self, solution: str) -> str:
-        return solution.strip().lower()
-
-    def _extract_answer_from_model_completion(self, completion: str) -> str:
-        if not completion:
-            return ""
-
-        # 1. \boxed{} content
-        box = self._last_boxed_only_string(completion)
-        if box:
-            ans = self._remove_boxed(box)
-            if ans:
-                lower = ans.strip().lower()
-                if lower in ("yes", "no"):
-                    return lower
-
-        # 2. First occurrence of "yes" or "no" as a whole word
-        import re as _re
-        m = _re.search(r'\b(yes|no)\b', completion.lower())
-        if m:
-            return m.group(1)
-
-        return ""
-
-
-# ── BBH (Big-Bench Hard) evaluator ────────────────────────────────────────────
-# BBH tasks have heterogeneous answer formats (letters, words, numbers, dates).
-# We use a multi-strategy approach: exact match → normalised string → numeric.
-
-class BBHEvaluator(Evaluator):
-    """
-    Evaluator for BIG-Bench Hard tasks.
-
-    BBH answers can be:
-      - Multiple-choice letters: (A), (B), (C) …
-      - Short strings: "valid", "True", "False", specific words
-      - Numbers or dates
-
-    Extraction: \\boxed{} first, then last parenthesised letter (A)/(B)…,
-    then last quoted string, then full stripped completion.
-    """
-
-    def _check_answers_equiv(self, answer_a: str, answer_b: str):
-        if answer_a is None or answer_b is None:
-            return None
-        a = answer_a.strip().lower().strip("().,")
-        b = answer_b.strip().lower().strip("().,")
-        if a == b:
-            return True
-        # Numeric fallback
-        try:
-            return abs(float(a) - float(b)) < 1e-6
-        except (ValueError, TypeError):
-            pass
-        return False
-
-    def validate_model_completion(self, completion: str) -> bool:
-        return isinstance(completion, str) and len(completion.strip()) > 0
-
-    def _extract_answer_from_gold_solution(self, solution: str) -> str:
-        return solution.strip()
-
-    def _extract_answer_from_model_completion(self, completion: str) -> str:
-        if not completion:
-            return ""
-
-        # 1. \boxed{} content
-        box = self._last_boxed_only_string(completion)
-        if box:
-            ans = self._remove_boxed(box)
-            if ans:
-                return ans.strip()
-
-        # 2. Last parenthesised option: (A), (B), …
-        import re as _re
-        matches = _re.findall(r'\(([A-E])\)', completion.upper())
-        if matches:
-            return f"({matches[-1]})"
-
-        # 3. Last line of the completion (often the answer in BBH)
-        lines = [l.strip() for l in completion.strip().splitlines() if l.strip()]
-        if lines:
-            return lines[-1]
-
-        return completion.strip()
-
-
 EvaluatorMapping = {
-    "GSM8K":             GSM8KEvaluator,
-    "GSM_Hard":          GSM8KEvaluator,
-    "MATH":              MATHEvaluator,
-    "MATH500":           MATHEvaluator,
-    "ScaleQuest":        MATHEvaluator,
-    "ScaleQuestLabeled": MATHEvaluator,
-    "OpenMathInstruct":  MATHEvaluator,
-    "AMC2022":           MATHEvaluator,
-    "AMC2023":           MATHEvaluator,
-    "AMC":               MATHEvaluator,
-    "AIME":              MATHEvaluator,
-    "AIME2023":          MATHEvaluator,
-    "AIME2024":          MATHEvaluator,
-    "OlympiadBench":     OlympiadEvaluator,
-    "NuminaMath":        MATHEvaluator,
-    # ── New general-reasoning benchmarks ──────────────────────────────────────
-    "MMLU":              MCQEvaluator,
-    "ARC":               MCQEvaluator,
-    "ARC_Challenge":     MCQEvaluator,
-    "BBH":               BBHEvaluator,
-    "TruthfulQA":        MCQEvaluator,   # gold = correct choice text; compare as string
-    "StrategyQA":        YesNoEvaluator,
+    "GSM8K":         GSM8KEvaluator,
+    "MATH":          MATHEvaluator,
+    "MATH500":       MATHEvaluator,
+    "AMC":           MATHEvaluator,
+    "AMC2023":       MATHEvaluator,
+    "AIME":          MATHEvaluator,
+    "AIME2024":      MATHEvaluator,
+    "OlympiadBench": OlympiadEvaluator,
 }
 
 
 def get_evaluator(task_name: str = "MATH500") -> Evaluator:
+    """Instantiate the evaluator registered for ``task_name``."""
     if task_name in EvaluatorMapping:
         return EvaluatorMapping[task_name]()
-    if any(x in task_name for x in ["MATH", "ScaleQuest", "NuminaMath", "OpenMathInstruct"]):
+    if "MATH" in task_name:
         return MATHEvaluator()
-    if any(x in task_name for x in ["MMLU", "ARC"]):
-        return MCQEvaluator()
-    if "BBH" in task_name:
-        return BBHEvaluator()
-    if "StrategyQA" in task_name or "strategy" in task_name.lower():
-        return YesNoEvaluator()
-    if "TruthfulQA" in task_name or "truthful" in task_name.lower():
-        return MCQEvaluator()
     raise ValueError(f"Task '{task_name}' not in EvaluatorMapping")

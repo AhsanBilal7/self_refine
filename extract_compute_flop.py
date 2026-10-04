@@ -1,85 +1,52 @@
 #!/usr/bin/env python3
 """
-extract_compute_flop.py
-=======================
-Compute theoretical FLOPs for the CIMR pipeline from stored JSON results.
+Inference-compute (TFLOP) accounting for breadth-depth refinement runs.
 
-Token counts are measured with **tiktoken** (exact BPE tokenization) rather
-than a character-ratio heuristic.  Output tokens are counted directly from
-the stored response text; input tokens are reconstructed from the pipeline
-structure and config-based truncation limits.
+Implements the paper's "Compute Budget and TFLOP Accounting":
 
-FLOPs are estimated using the standard LLM scaling-law approximation:
+    generation call u :  2 * P_gen * (T_in + T_out)
+    PRM scoring call v:  2 * P_rm  * T_in               (prefill only)
 
-    generation :  FLOPs = 2 × P × (T_in + T_out)
-    PRM scoring:  FLOPs = 2 × P_prm × T_in          (prefill-only, no decode)
+summed over every call recorded in a ``cimr_full_results_*.json`` store.
+Output tokens are counted with tiktoken from the stored responses; input
+tokens are rebuilt from the prompt structure with the pipeline's character
+truncation applied, plus ``SYSTEM_OVERHEAD_TOKENS`` for the system prompt and
+chat template (these are not stored).
 
-Pipeline phases counted per (rollout × depth) step
----------------------------------------------------
-  Phase A  – reasoning generation          (generator model)
-  Phase B  – self-critique generation      (generator model)  [0 if no_critique]
-  Phase C  – self-correction generation    (generator model)  [0 if no_correction]
-  Phase E  – PRM scoring × 2               (verifier model,
-                reasoning_trace + corrected_trace as separate forward passes)
+Calls per (rollout, depth) step
+-------------------------------
+  phase A  reasoning continuation g^(d)  (initial rollout at d = 1)  generator
+  phase B  self-critique c^(d)           (0 under --no_critique)     generator
+  phase C  self-correction r^(d)         (0 under --no_correction)   generator
+  phase E  PRM scoring of g^(d) and r^(d)                            verifier
 
-BoN comparison baseline
------------------------
-Best-of-N(N) runs N independent reasoning passes only (no critique/correction):
-    bon_flop_per_q = N × 2 × P_gen × (T_in_depth1 + mean_T_out_A)
+The method uses no verifier, so its compute C_m in the paper is
+``generator_tflop_per_question`` (phases A-C). ``verifier_tflop_per_question``
+is the cost of the optional diagnostic PRM and ``total_tflop_per_question``
+includes it.
 
-    effective_bon_n = total_cimr_flop_per_q / flop_per_single_bon_sample
-
-Tokeniser registry
-------------------
-Each model is mapped to the tiktoken encoding that best approximates its
-tokenizer.  All four target models (Qwen2.5-Math-7B, Qwen2.5-1.5B,
-Ministral-8B, LLaMA-3.1-8B) use BPE vocabularies derived from or closely
-matching cl100k_base.
+``effective_bon_n`` is how many depth-1 reasoning samples would cost the same
+as the full per-question total.
 
 Usage
 -----
-    python extract_compute_flop.py \\
-        --results_dir  experiments_results/results_paired \\
-        --output_dir   experiments_results/compute_flops
-
-    # Override tiktoken encoding globally
-    python extract_compute_flop.py --encoding o200k_base
-
-    # Process only specific display-name models
-    python extract_compute_flop.py --models "Ministral-8B" "Qwen2.5-1.5B" "Qwen2.5-Math-7B" "LLaMA-3.1-8B"
-    python extract_compute_flop.py --results_dir  experiments_results/results_baselines --output_dir   experiments_results/compute_flops_baseline --models "Ministral-8B" "Qwen2.5-1.5B" "Qwen2.5-Math-7B" "LLaMA-3.1-8B"
-    # Also include no_critique ablation files
-    python extract_compute_flop.py --include_no_critique
+    python extract_compute_flop.py \
+        --results_dir experiments_results/results_paired \
+        --output_dir  experiments_results/compute_flops \
+        [--models "Qwen2.5-Math-7B" "Qwen2.5-1.5B"] [--include_no_critique] \
+        [--encoding o200k_base]
 
 Output
 ------
-Per model sub-directory (mirrors extract_cimr_metrics.py layout):
-    <output_dir>/<model>/flop_summary.json
+    <output_dir>/<model folder>/flop_summary.json   per-file metrics, plus
+                                                    a depth-wise breakdown
+    <output_dir>/compute_flop_summary.csv           one row per file
 
-Master CSV across all models:
-    <output_dir>/compute_flop_summary.csv
-
-CSV columns
------------
-model, dataset, N, D, suffix,
-total_tflop_per_question,          # generator + verifier (TFLOPs, mean over qs)
-generator_tflop_per_question,      # phases A + B + C only
-verifier_tflop_per_question,       # PRM verifier (Phase E) only
-phase_a_tflop_per_question,        # reasoning generation
-phase_b_tflop_per_question,        # self-critique
-phase_c_tflop_per_question,        # self-correction
-bon_baseline_tflop_per_question,   # BoN(N) — N reasoning-only passes
-effective_bon_n,                   # BoN samples equivalent to CIMR total FLOPs
-mean_reasoning_out_tokens,         # mean Phase A output tokens per step
-mean_critique_out_tokens,          # mean Phase B output tokens per step
-mean_correction_out_tokens,        # mean Phase C output tokens per step
-mean_total_out_tokens_per_rollout,
-total_tflop_all_questions,         # sum over all questions in file
-majority_accuracy,
-max_prm_accuracy,
-n_questions,
-gen_params_b,
-tiktoken_encoding,
+CSV columns: model, dataset, N, D, suffix, total/generator/verifier and
+phase A/B/C TFLOPs per question, bon_baseline_tflop_per_question,
+effective_bon_n, mean output tokens per phase and per rollout,
+total_tflop_all_questions, majority_accuracy, max_prm_accuracy, n_questions,
+gen_params_b, tiktoken_encoding.
 """
 
 from __future__ import annotations
@@ -129,24 +96,21 @@ MODEL_REGISTRY: Dict[str, Tuple[float, str, str]] = {
     "Ministral-8B":                (8.030, "Ministral-8B",    "cl100k_base"),
     "Llama-3.1-8B-Instruct":       (8.030, "LLaMA-3.1-8B",    "cl100k_base"),
     "Llama-3.1-8B":                (8.030, "LLaMA-3.1-8B",    "cl100k_base"),
-    # Additional models present in experiments_results
     "Llama-3.2-1B-Instruct":       (1.236, "LLaMA-3.2-1B",    "cl100k_base"),
     "Llama-3.2-3B-Instruct":       (3.212, "LLaMA-3.2-3B",    "cl100k_base"),
     "DeepSeek-R1-Distill-Qwen-7B": (7.617, "DeepSeek-R1-7B",  "cl100k_base"),
 }
 
-# Qwen2.5-Math-PRM-7B verifier (always used as PRM scorer)
+# Diagnostic PRM (Qwen2.5-Math-PRM-7B)
 VERIFIER_PARAMS_B: float   = 7.617
 VERIFIER_ENCODING: str     = "cl100k_base"
 
 # =============================================================================
-# Pipeline config defaults  (must match run_paired_ablation.py defaults)
+# Truncation limits (must match run_paired_ablation.sh)
 # =============================================================================
 
-# These are character-level truncation limits applied in cimr_step.py *before*
-# the text reaches the model.  We truncate stored text to the same limits
-# before tokenising, so Phase-B/C input token counts faithfully reflect what
-# the model actually sees.
+# Character limits applied to traces inside the prompts. Stored text is cut to
+# the same limits before tokenising so input counts match what the model saw.
 CRITIQUE_MAX_TRACE_CHARS:      int = 4000
 CORRECTION_MAX_TRACE_CHARS:    int = 4000
 CORRECTION_MAX_CRITIQUE_CHARS: int = 1500
@@ -195,8 +159,9 @@ def _count_tokens_truncated(text: str, max_chars: int, encoding_name: str) -> in
     """
     Count tokens *after* applying the pipeline's character-level truncation.
 
-    This mirrors cimr_step.py: the text is sliced to ``max_chars`` chars
-    before being fed to the model, so we truncate first and then tokenise.
+    The prompts keep the head and tail of an over-long trace (see
+    ``src/cimr_prompts.py``); keeping the first ``max_chars`` characters gives
+    the same character budget and a close token count.
     """
     truncated = text[:max_chars] if len(text) > max_chars else text
     return _count_tokens(truncated, encoding_name)
@@ -627,11 +592,6 @@ CSV_FIELDS = [
 ]
 
 
-def _metrics_to_csv_row(m: Dict[str, Any]) -> Dict[str, Any]:
-    return {f: m.get(f if f != "model" else "model_display", "") for f in CSV_FIELDS}
-
-
-# fix the "model" key (CSV calls it "model", dict stores it as "model_display")
 def metrics_to_csv_row(m: Dict[str, Any]) -> Dict[str, Any]:
     row = {f: m.get(f, "") for f in CSV_FIELDS}
     row["model"] = m.get("model_display", "")
@@ -646,7 +606,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     parser = argparse.ArgumentParser(
-        description="Compute theoretical FLOPs for CIMR results using tiktoken.",
+        description="TFLOP accounting for breadth-depth refinement result stores.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

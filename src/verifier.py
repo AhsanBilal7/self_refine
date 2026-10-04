@@ -1,39 +1,17 @@
-"""
-verifier.py
------------
-Scoring / verification of candidate reasoning traces.
+"""Process-reward-model (PRM) scoring of reasoning traces.
 
-Three verifier back-ends:
+The breadth-depth refinement method itself is verifier-free. A PRM is used
+for
 
-1. OutcomeVerifier          — binary correct/wrong vs gold answer (oracle only,
-                              leaks gold into selection — do NOT use for fair eval).
+* the ``bon`` (Best-of-N with verifier) baseline in ``run_eval.py``, and
+* diagnostic scores stored with every refinement step (``*_prm_score``); these
+  only break exact vote ties and never change which trace is refined.
 
-2. LengthHeuristicVerifier  — proxy score; no gold needed; deployment baseline.
-
-3. HFProcessRewardVerifier  — Qwen2.5-Math-PRM-7B correct implementation.
-
-Correct PRM usage (Qwen2.5-Math-PRM-7B)
------------------------------------------
-The model is NOT a sequence classifier.  It is an AutoModel whose final hidden
-states at special <extra_0> step-separator tokens carry the per-step reward
-signal.  The correct procedure is:
-
-  1. Build a FULL chat-formatted string with the system prompt, user question,
-     and the assistant's full response, where reasoning steps are joined with
-     the <extra_0> separator token.
-  2. Run ONE forward pass over the full sequence.
-  3. Extract hidden-state logits ONLY at the positions of <extra_0> tokens.
-  4. Apply softmax over the 2-class dimension → take the positive-class
-     probability (index 1) as the per-step reward score.
-  5. Aggregate step scores per trace: min / mean / last.
-
-This preserves full left-context for every step — step 3 is scored knowing
-what steps 1 and 2 said, which is the whole point of a Process Reward Model.
-
-The old implementation used AutoModelForSequenceClassification and scored each
-step as an isolated string.  This was wrong in two ways:
-  - Wrong model class (classification head vs hidden-state rewards).
-  - No context: step 3 scored without knowing steps 1-2.
+``HFProcessRewardVerifier`` implements the Qwen2.5-Math-PRM-7B protocol: the
+response is split into steps joined by the ``<extra_0>`` separator, the full
+(system, user, assistant) conversation is scored in one forward pass, and the
+positive-class probability at each separator is that step's reward. Step
+rewards are aggregated per trace by ``min`` (default), ``mean`` or ``last``.
 """
 
 import logging
@@ -81,99 +59,24 @@ def extract_boxed_answer(trace: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. Outcome Verifier
-# ──────────────────────────────────────────────────────────────────────────────
-
-class OutcomeVerifier:
-    """
-    Binary verifier: uses math_equal from grader.py.
-
-    WARNING: leaks gold answer into selection.
-    Use ONLY as an oracle upper bound — never for fair evaluation.
-    """
-
-    def __init__(self, data_name: str = "math", timeout: bool = True):
-        self.data_name = data_name
-        self.timeout   = timeout
-
-    def score(self, trace: str, gold_answer: str) -> float:
-        try:
-            from parser import extract_answer  # type: ignore
-            pred = extract_answer(trace, self.data_name)
-        except Exception:
-            pred = extract_boxed_answer(trace)
-        try:
-            from grader import math_equal  # type: ignore
-            return 1.0 if math_equal(pred, gold_answer, timeout=self.timeout) else 0.0
-        except Exception:
-            return 1.0 if str(pred).strip() == str(gold_answer).strip() else 0.0
-
-    def score_batch(self, traces: List[str], gold_answer: str) -> np.ndarray:
-        return np.array([self.score(t, gold_answer) for t in traces])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. Length-Heuristic Verifier
-# ──────────────────────────────────────────────────────────────────────────────
-
-class LengthHeuristicVerifier:
-    """
-    Proxy verifier — no gold, no PRM needed.
-    Rewards traces that have a \\boxed{} answer and are concise.
-    Use only as a deployment / no-label baseline.
-    """
-
-    def __init__(self, max_chars: int = 4000):
-        self.max_chars = max_chars
-
-    def score(self, trace: str) -> float:
-        has_box      = 1.0 if extract_boxed_answer(trace) else 0.0
-        length_score = max(0.0, 1.0 - len(trace) / self.max_chars)
-        return 0.5 * has_box + 0.5 * length_score
-
-    def score_batch(self, traces: List[str]) -> np.ndarray:
-        return np.array([self.score(t) for t in traces])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. HF Process-Reward Verifier  (Qwen2.5-Math-PRM-7B correct implementation)
+# Process-reward verifier (Qwen2.5-Math-PRM-7B)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class HFProcessRewardVerifier:
-    """
-    Correct implementation of Qwen2.5-Math-PRM-7B scoring.
+    """Score traces with a Qwen2.5-Math-PRM-style process reward model.
 
-    Key design decisions
-    --------------------
-    Model class : AutoModel  (NOT AutoModelForSequenceClassification)
-      The reward signal comes from hidden-state logits at <extra_0> positions,
-      not from a classification head over the [CLS] token.
+    The model is loaded with ``AutoModel``; its output at each ``<extra_0>``
+    position holds two logits whose softmax gives the step reward. Traces are
+    scored one at a time so each step sees its full left context.
 
-    Input format : full chat conversation with <extra_0> step separators
-      Each trace is formatted as:
-        [system] + [user: question] + [assistant: step1<extra_0>step2<extra_0>...]
-      The FULL sequence is passed in ONE forward pass so every step is scored
-      with complete left-context from all preceding steps.
-
-    Score extraction : make_step_rewards()
-      Finds <extra_0> token positions in the input_ids.
-      Reads hidden-state logits at those positions.
-      Applies softmax over the 2-class dim and takes index 1 (good-step prob).
-
-    Aggregation : min | mean | last
-      min  — most conservative; penalises any weak step (recommended)
-      mean — average quality across all steps
-      last — quality of the final answer step only
-
-    Batching
-    --------
-    Each trace requires a separate forward pass (different question context).
-    Traces for the same question share the same question prefix — they could
-    be batched, but only if padded to the same length which is expensive for
-    long traces.  We process one trace at a time for correctness, batching
-    only within a single trace's steps via the flat-sequence approach.
-    For throughput, increase batch_size to process multiple traces at once
-    (traces are padded to the same length within the batch).
+    Parameters
+    ----------
+    model_name    : PRM checkpoint (default ``Qwen/Qwen2.5-Math-PRM-7B``).
+    aggregation   : ``min`` | ``mean`` | ``last`` over step rewards.
+    device        : ``auto`` (device_map) or an explicit device string.
+    cache_dir     : Hugging Face cache directory.
+    batch_size    : kept for interface compatibility; scoring is per trace.
+    system_prompt : system message used at scoring time (PRM training format).
     """
 
     def __init__(
@@ -182,7 +85,7 @@ class HFProcessRewardVerifier:
         aggregation: str = "min",
         device: str = "auto",
         cache_dir: Optional[str] = None,
-        batch_size: int = 8,        # traces per forward pass (not steps)
+        batch_size: int = 8,
         system_prompt: str = PRM_SYSTEM_PROMPT,
     ):
         self.aggregation   = aggregation
@@ -198,10 +101,9 @@ class HFProcessRewardVerifier:
             trust_remote_code=True,
             cache_dir=cache_dir,
         )
-        # Padding side: right for causal LM with variable-length sequences.
-        # The reward is read from <extra_0> positions inside the sequence,
-        # not from a fixed position, so padding side affects only the
-        # attention mask — right-padding keeps the real tokens contiguous.
+        # Rewards are read at <extra_0> positions, so padding side only
+        # affects the attention mask; right padding keeps real tokens
+        # contiguous.
         self._tokenizer.padding_side = "right"
         if self._tokenizer.pad_token_id is None:
             self._tokenizer.pad_token_id = self._tokenizer.eos_token_id
@@ -282,7 +184,7 @@ class HFProcessRewardVerifier:
         """
         Extract per-step reward scores from the model's hidden-state logits.
 
-        Taken directly from the Qwen2.5-Math-PRM-7B official usage example.
+        Follows the Qwen2.5-Math-PRM-7B reference usage.
 
         Parameters
         ----------
@@ -357,9 +259,8 @@ class HFProcessRewardVerifier:
         Parameters
         ----------
         traces   : N candidate traces (all answers to the same question)
-        question : the question text — required for correct PRM input format.
-                   If None (legacy call), traces are scored without question
-                   context (less accurate but still works).
+        question : the question text, needed for the PRM input format. If
+                   None, traces are scored with an empty user turn.
 
         Returns
         -------
@@ -371,7 +272,6 @@ class HFProcessRewardVerifier:
                 "PRM scores will be less accurate. "
                 "Pass question= for correct results."
             )
-            # Score without question context — build a minimal conversation
             question = ""
 
         scores = []
@@ -393,26 +293,19 @@ def build_verifier(
     cache_dir: Optional[str] = None,
     batch_size: int = 8,
 ):
-    """
-    Factory for verifiers.
+    """Build the PRM verifier (``verifier_type`` must be ``"prm"``).
 
-    verifier_type : 'prm' (default) | 'outcome' | 'length'
-    batch_size    : traces per forward pass for HFProcessRewardVerifier
+    ``data_name`` is accepted for interface compatibility and is unused.
     """
-    if verifier_type == "outcome":
-        return OutcomeVerifier(data_name=data_name)
-    elif verifier_type == "length":
-        return LengthHeuristicVerifier()
-    elif verifier_type == "prm":
-        mdl = prm_model or "Qwen/Qwen2.5-Math-PRM-7B"
-        return HFProcessRewardVerifier(
-            model_name=mdl,
-            aggregation=prm_aggregation,
-            device=device,
-            cache_dir=cache_dir,
-            batch_size=batch_size,
-        )
-    raise ValueError(f"Unknown verifier_type: {verifier_type!r}")
+    if verifier_type != "prm":
+        raise ValueError(f"Unknown verifier_type: {verifier_type!r} (expected 'prm')")
+    return HFProcessRewardVerifier(
+        model_name=prm_model or "Qwen/Qwen2.5-Math-PRM-7B",
+        aggregation=prm_aggregation,
+        device=device,
+        cache_dir=cache_dir,
+        batch_size=batch_size,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -425,31 +318,11 @@ def score_candidates(
     gold_answer: Optional[str] = None,
     question: Optional[str] = None,
 ) -> np.ndarray:
+    """Score the candidate traces for one question (higher is better).
+
+    ``gold_answer`` is accepted for interface compatibility and ignored; the
+    verifier never sees the gold answer.
     """
-    Score a list of candidate traces.
-
-    Parameters
-    ----------
-    traces      : model-generated reasoning strings (all for ONE question)
-    verifier    : instance of any verifier class above
-    gold_answer : required for OutcomeVerifier; ignored otherwise
-    question    : the question text — passed to HFProcessRewardVerifier
-                  so each trace is scored in full conversation context.
-                  Should always be provided when using PRM.
-
-    Returns
-    -------
-    np.ndarray of float scores, shape (len(traces),), higher = better
-    """
-    if isinstance(verifier, OutcomeVerifier):
-        if gold_answer is None:
-            raise ValueError("OutcomeVerifier requires gold_answer.")
-        return verifier.score_batch(traces, gold_answer)
-
-    elif isinstance(verifier, LengthHeuristicVerifier):
-        return verifier.score_batch(traces)
-
-    elif isinstance(verifier, HFProcessRewardVerifier):
+    if isinstance(verifier, HFProcessRewardVerifier):
         return verifier.score_batch(traces, question=question)
-
     raise TypeError(f"Unsupported verifier type: {type(verifier)}")

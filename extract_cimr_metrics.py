@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-extract_cimr_metrics.py
-=======================
-Extract rich analysis metrics from CIMR full-results JSON files for
-EMNLP paper figures and tables.
+Refinement-dynamics metrics from breadth-depth refinement result stores.
+
+Reads every ``cimr_full_results_<dataset>_N<N>_d<D>[<suffix>].json`` under
+``--results_dir`` and writes one ``metrics_summary.json`` per model folder
+under ``--output_dir`` (keyed by input filename). ``export_paper_csvs.py``
+turns these into the CSVs behind the paper's refinement-dynamics figures.
 
 Usage
 -----
@@ -11,68 +13,48 @@ Usage
         --results_dir experiments_results/results_paired \
         --output_dir  experiments_results/cimr_metrics
 
-Output mirrors the input hierarchy: for each
-    <results_dir>/<model>/cimr_full_results_<dataset>_N<N>_d<D>[<suffix>].json
-a metrics file is written to:
-    <output_dir>/<model>/metrics_cimr_<dataset>_N<N>_d<D>[<suffix>].json
+Notation follows the paper's appendix "Diagnostic Metric Definitions". At depth
+d, rollout i has the pre-correction answer alpha = Extract(g^(d))
+(``reasoning_answer``) and the post-correction answer beta = Extract(r^(d))
+(``corrected_answer``). Answers are compared after ``_norm``: whitespace and
+LaTeX spacing removed, one brace layer unwrapped, trailing decimal zeros
+stripped, lower-cased. Depth-wise votes use simple string matching against the
+gold answer, so they can differ slightly from the final accuracy, which uses
+the symbolic evaluator.
 
-Metrics computed (all per-file, aggregated over all questions)
---------------------------------------------------------------
-
+Metrics per file
+----------------
 accuracy
-  majority_accuracy          fraction of questions correct by majority vote
-  max_prm_accuracy           fraction correct by max-PRM selection
-  oracle_accuracy            pass@N: any rollout answered correctly
-  pass_at_1_accuracy         mean per-rollout accuracy (averaged over rollouts then questions)
-  depth_wise_majority_acc    majority accuracy if inference stopped at each depth d
-  depth_improvement_rate     per-depth Δ accuracy vs depth d-1 (shows refinement gains)
-  depth_recovery_rate        fraction of questions newly correct at depth d (were wrong at d-1)
-  depth_regression_rate      fraction of questions newly wrong at depth d (were right at d-1)
+  majority_accuracy           final plurality-vote accuracy (stored flag)
+  max_prm_accuracy            diagnostic max-PRM selection accuracy
+  oracle_accuracy             pass@N: some rollout's final answer is correct
+  pass_at_1_accuracy          mean per-rollout accuracy
+  depth_wise_majority_acc     A(d): plurality-vote accuracy at depth d
+  depth_improvement_rate      A(d) - A(d-1) for d >= 2; A(1) at d = 1
+  depth_recovery_rate         rho_rec(d): wrong at d-1 -> correct at d (0 at d = 1)
+  depth_regression_rate       rho_reg(d): correct at d-1 -> wrong at d (0 at d = 1)
 
-prm_dynamics (per depth)
-  mean_reasoning_prm         mean PRM on raw reasoning traces
-  mean_corrected_prm         mean PRM on self-corrected traces
-  mean_prm_lift              mean (corrected - reasoning) delta
-  frac_prm_improved          fraction of rollouts where correction raised PRM
-  frac_prm_hurt              fraction where correction lowered PRM
-  prm_lift_std               std of PRM lifts (shows consistency of correction)
+correction_effectiveness (per depth, over all question-rollout pairs)
+  answer_change_rate          mu_Delta(d): beta differs from alpha (beta non-empty)
+  flip_wrong_to_correct       mu_{W->C}(d)
+  flip_correct_to_wrong       mu_{C->W}(d)
+  flip_wrong_to_wrong         changed but still wrong
+  net_correction_benefit      B(d) = mu_{W->C}(d) - mu_{C->W}(d)
 
-correction_effectiveness (per depth)
-  answer_change_rate         fraction of rollouts where corrected_answer ≠ reasoning_answer
-  flip_wrong_to_correct      fraction that improved (needs gold)
-  flip_correct_to_wrong      fraction that regressed (needs gold)
-  flip_wrong_to_wrong        fraction changed but still wrong
-  net_correction_benefit     flip_wrong_to_correct − flip_correct_to_wrong
+diversity
+  mean_n_unique_final_answers mean |A_q^(D)|
+  frac_questions_diverse      terminal diversity rate: |A_q^(D)| > 1
+  depth_wise_answer_agreement U(d): all non-empty rollout answers agree
+  mean_final_prm_std / mean_final_prm_range   spread of terminal PRM scores
 
-diversity (per question, then aggregated)
-  mean_n_unique_final_answers    mean count of distinct final answers per question
-  frac_questions_diverse         fraction where not all N rollouts agree
-  mean_final_prm_std             mean std of final PRM scores across rollouts
-  mean_final_prm_range           mean (max−min) final PRM scores across rollouts
-  depth_wise_answer_agreement    fraction of questions where all N rollouts agree, by depth
-
-prm_calibration
-  mean_max_prm_score_correct     mean max_prm_score on correct questions
-  mean_max_prm_score_incorrect   mean max_prm_score on incorrect questions
-  prm_score_gap                  correct − incorrect mean (positive = well-calibrated)
-  majority_correct_mean_prm      mean PRM of majority-selected rollout, correct qs
-  majority_incorrect_mean_prm    same for incorrect qs
-
-voting
-  mean_majority_vote_margin      mean (winning_vote_count / N) — confidence
-  majority_maxprm_agree_rate     fraction where both methods select same answer
-  majority_correct_when_disagree when they disagree, fraction where majority is right
-  max_prm_correct_when_disagree  when they disagree, fraction where max_prm is right
-
-prm_monotonicity (per rollout across depths)
-  frac_rollouts_monotone_up      fraction of rollouts with non-decreasing PRM across all depths
-  frac_rollouts_ever_improve     fraction that improve at any depth vs depth-1
-  mean_final_vs_initial_prm_lift mean (final_depth_prm - depth1_prm) per rollout
+Diagnostic PRM sections (empty if the run used --no_prm)
+  prm_dynamics      per depth: PRM of g^(d) vs r^(d) and the lift from correction
+  prm_calibration   PRM score of correct vs incorrect selections
+  voting            vote margin and majority vs max-PRM agreement
+  prm_monotonicity  whether r^(d) PRM scores rise across depths
 
 efficiency
-  mean_elapsed_sec_per_question
-  total_elapsed_sec
-  mean_elapsed_sec_per_rollout
+  mean_elapsed_sec_per_question, total_elapsed_sec, mean_elapsed_sec_per_rollout
 """
 
 from __future__ import annotations
@@ -84,13 +66,13 @@ import math
 import os
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ─── Answer normalization (mirrors cimr_aggregator._normalize_answer_key) ────
+# ─── Answer normalisation (cimr_aggregator.normalize_answer_key + lower-casing) ─
 
 def _norm(ans: str) -> str:
     s = str(ans or "").strip()
@@ -245,7 +227,7 @@ def extract_metrics(store: dict, source_file: str) -> dict:
             for d in range(1, D + 1)
         },
     }
-    # Fix depth 1 improvement (no prior depth)
+    # No A(0) is stored, so depth 1 reports A(1) itself.
     accuracy["depth_improvement_rate"]["1"] = round(
         depth_majority_correct.get(1, 0) / denom_gold, 4
     )
@@ -540,7 +522,7 @@ def _write_summary(summary: dict, out_path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract CIMR metrics for EMNLP paper analysis.",
+        description="Extract refinement-dynamics metrics from result stores.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

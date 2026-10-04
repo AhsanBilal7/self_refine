@@ -1,44 +1,34 @@
-"""
-evaluator.py
-------------
-Evaluation loop with full on-the-go persistence and crash-safe resumption.
+"""Resumable evaluation loop for the baselines in ``inference_methods``.
 
-Persistence guarantees
-----------------------
-JSONL  : written and flushed after EVERY question.
-         If the process crashes at question 400/500, questions 0-399 are safe.
-
-Summary JSON : atomically rewritten after every question via write-to-tmp
-         then os.replace().  The summary always reflects the exact set of
-         questions saved in the JSONL, so they are always consistent.
-
-Resumption
-----------
-On restart, evaluate_batch() reads the existing JSONL to find which
-questions are already done and skips them.  The summary JSON is rebuilt
-from the JSONL before continuing so statistics are always accurate.
-
-Architecture change vs previous version
-----------------------------------------
-Previous: run_batch(all_pending) → returns list → then save
-New     : for each question → generate → save JSONL → update summary
-
-This means BoN/DN-BoN (which were already per-question loops inside
-run_batch) now yield results one at a time via a generator, and the
-evaluator saves each result immediately.  Greedy (which truly batches N
-questions per generate() call) saves after each chunk.
+* Every question is appended to the JSONL file and flushed as soon as it is
+  scored, and the summary JSON is rewritten atomically after each question.
+* On restart, questions already present in the JSONL (matched on the first
+  200 characters of the question) are skipped and the summary is rebuilt from
+  the saved rows.
+* Greedy decoding batches ``model.batch_size`` questions per ``generate()``
+  call; sampling methods decode a flat list of ``Q x N`` prompts and score each
+  question as soon as its ``N`` samples are complete.
 """
 
 import json
 import logging
 import os
 import time
-from typing import List, Dict, Any, Optional, Iterator
+from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
 from tqdm import tqdm
 
-from .inference_methods import InferenceResult
+from .inference_methods import (
+    BestOfN,
+    BestOfNMajority,
+    GreedyInference,
+    GreedyPassN,
+    InferenceResult,
+    _check_correct,
+    _extract_pred,
+    _make_error_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,17 +98,9 @@ def _load_completed(jsonl_path: str):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _greedy_results(method, pending, max_new_tokens) -> Iterator[tuple]:
-    """
-    Yield (example, InferenceResult) one at a time for GreedyInference.
-
-    Greedy batches GREEDY_BATCH questions per generate() call, so we run
-    the full batch, then yield individual results immediately so each can
-    be saved before the next chunk starts.
-    """
-    from inference_methods import GreedyInference  # type: ignore
-    bs        = method.model.batch_size
-    n         = len(pending)
-    per_chunk = round(0.0, 4)   # updated per chunk
+    """Yield ``(example, InferenceResult)`` for greedy decoding, chunk by chunk."""
+    bs = method.model.batch_size
+    n  = len(pending)
 
     chunk_bar = tqdm(
         range(0, n, bs),
@@ -146,7 +128,6 @@ def _greedy_results(method, pending, max_new_tokens) -> Iterator[tuple]:
         )
 
         for ex, gold, trace in zip(chunk_ex, golds, traces):
-            from inference_methods import _extract_pred, _check_correct  # type: ignore
             pred    = _extract_pred(trace, method.ev, method.data_name)
             correct = _check_correct(pred, gold, method.ev, method.data_name)
             res = InferenceResult(
@@ -162,20 +143,11 @@ def _greedy_results(method, pending, max_new_tokens) -> Iterator[tuple]:
 
 
 def _sampling_results(method, pending, max_new_tokens, label, colour) -> Iterator[tuple]:
-    """
-    Interleaved generation + saving via generate_samples_flat generator.
+    """Yield ``(example, InferenceResult)`` for a sampling method.
 
-    generate_samples_flat() yields (q_idx, traces) as each question's
-    N samples become available — after every chunk of batch_size sequences.
-
-    With batch_size=64, N=8:
-      → 8 questions saved per generate() call
-    With batch_size=128, N=8:
-      → 16 questions saved per generate() call
-
-    This function receives each (q_idx, traces) immediately, runs _select(),
-    and yields (example, InferenceResult) to the evaluator for saving.
-    No waiting for all chunks to finish.
+    Consumes ``model.generate_samples_flat`` and applies ``method._select`` as
+    soon as a question's ``N`` samples are available. If flat generation
+    fails, the remaining questions are generated one at a time.
     """
     bs = method.model.batch_size
     N  = method.N
@@ -213,7 +185,6 @@ def _sampling_results(method, pending, max_new_tokens, label, colour) -> Iterato
                 res = method._select(ex["question"], gold, traces, elapsed=0.0)
             except Exception as e:
                 logger.error(f"  _select q[{q_idx}] failed: {e}")
-                from inference_methods import _make_error_result  # type: ignore
                 res = _make_error_result(
                     method.__class__.__name__.lower(), ex["question"], gold, N
                 )
@@ -227,7 +198,7 @@ def _sampling_results(method, pending, max_new_tokens, label, colour) -> Iterato
                     refresh=False,
                 )
             save_bar.update(1)
-            yield ex, res   # → evaluator writes JSONL + summary immediately
+            yield ex, res
 
     except Exception as e:
         logger.error(f"  generate_samples_flat failed: {e}. Falling back to per-question.")
@@ -242,7 +213,6 @@ def _sampling_results(method, pending, max_new_tokens, label, colour) -> Iterato
                 res = method._select(ex["question"], gold, traces, elapsed=0.0)
             except Exception as e2:
                 logger.error(f"  fallback q[{i}] failed: {e2}")
-                from inference_methods import _make_error_result  # type: ignore
                 res = _make_error_result(
                     method.__class__.__name__.lower(), ex["question"], gold, N
                 )
@@ -272,7 +242,7 @@ def evaluate_batch(
 
     Parameters
     ----------
-    method         : GreedyInference / BestOfN / DNBestOfN
+    method         : GreedyInference / BestOfN / BestOfNMajority / GreedyPassN
     examples       : list of {'question', 'answer', '_data_name', ...}
     max_new_tokens : generation length cap
     save_path      : JSONL file — one line appended per question, immediately
@@ -286,9 +256,6 @@ def evaluate_batch(
     -------
     dict: accuracy, n_correct, n_total, avg_elapsed_sec, total_wall_sec, results
     """
-    from inference_methods import GreedyInference, BestOfN, DNBestOfN  # type: ignore
-    from inference_methods import GreedyPassN, BestOfNMajority          # type: ignore
-    from inference_methods import DNBonUpdated                           # type: ignore
     method_name = method.__class__.__name__
 
     # ── load already-completed results from previous run ──────────────────────
@@ -332,11 +299,6 @@ def evaluate_batch(
             method, pending, max_new_tokens,
             label=f"[BoN N={method.N}]", colour="blue",
         )
-    elif isinstance(method, DNBestOfN):
-        result_gen = _sampling_results(
-            method, pending, max_new_tokens,
-            label=f"[DN-BoN N={method.N} α={method.alpha}]", colour="magenta",
-        )
     elif isinstance(method, GreedyPassN):
         result_gen = _sampling_results(
             method, pending, max_new_tokens,
@@ -347,15 +309,6 @@ def evaluate_batch(
             method, pending, max_new_tokens,
             label=f"[BoN-Majority N={method.N}]", colour="yellow",
         )
-    elif isinstance(method, DNBonUpdated):
-        # DORA: soft quality × uniqueness scoring.
-        # Uses the same _sampling_results generator as other sampling methods —
-        # the selection logic is fully self-contained in DNBonUpdated._select().
-        result_gen = _sampling_results(
-            method, pending, max_new_tokens,
-            label=f"[DN-BoN-Updated N={method.N} T_b={method.T_b} T_s={method.T_s}]",
-            colour="cyan",
-        )
     else:
         raise TypeError(f"Unknown method type: {type(method)}")
 
@@ -365,31 +318,8 @@ def evaluate_batch(
 
     try:
         for ex, res in result_gen:
-            # Build the row
             row = res.to_dict()
             row["question"] = ex["question"][:300]
-
-            # ── Motivation experiment extra fields ─────────────────────────────
-            # DNBestOfN._select attaches _all_preds and _all_correct as
-            # ad-hoc attributes so they can be serialised here without
-            # changing the InferenceResult dataclass signature.
-            if hasattr(res, "_all_preds"):
-                row["all_predictions"] = res._all_preds
-            if hasattr(res, "_all_correct"):
-                row["all_correct"] = res._all_correct
-            # DNBonUpdated (DORA) attaches additional scoring fields:
-            #   _quality_weights : softmax quality weights w_i  (list of N floats)
-            #   _gamma           : uniqueness scores γ_i = P_ii  (list of N floats)
-            #   _T_b / _T_s      : temperature hyperparameters used
-            if hasattr(res, "_quality_weights"):
-                row["quality_weights"] = [round(v, 6) for v in res._quality_weights]
-            if hasattr(res, "_gamma"):
-                row["gamma"] = [round(v, 6) for v in res._gamma]
-            if hasattr(res, "_T_b"):
-                row["T_b"] = res._T_b
-            if hasattr(res, "_T_s"):
-                row["T_s"] = res._T_s
-
             rows.append(row)
 
             # Update running counts
@@ -399,17 +329,15 @@ def evaluate_batch(
             total_time += res.elapsed_sec
             n_done_this_run += 1
 
-            # ── Save JSONL immediately ─────────────────────────────────────────
             if f_out:
                 f_out.write(json.dumps(row) + "\n")
-                f_out.flush()                    # guarantee OS write
+                f_out.flush()
 
-            # ── Rewrite summary JSON atomically ───────────────────────────────
+
             if summary_path and (n_done_this_run % summary_every == 0):
                 summary = _build_return(rows, n_correct, n_total, total_time)
                 _write_summary_atomic(summary, summary_path)
 
-            # ── Structured log ────────────────────────────────────────────────
             total_done = len(done_keys) + n_done_this_run
             if total_done % log_every == 0:
                 acc = n_correct / max(n_total, 1)
@@ -420,7 +348,7 @@ def evaluate_batch(
     finally:
         if f_out:
             f_out.close()
-        # Always write final summary even if we crashed mid-loop
+        # Write the summary even when the loop was interrupted.
         if summary_path and rows:
             summary = _build_return(rows, n_correct, n_total, total_time)
             _write_summary_atomic(summary, summary_path)
@@ -459,77 +387,6 @@ def _build_return(
     }
 
 
-def _empty_summary() -> Dict[str, Any]:
-    return {"accuracy": 0.0, "n_correct": 0, "n_total": 0,
-            "avg_elapsed_sec": 0.0, "total_wall_sec": 0.0, "results": []}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Legacy single-question loop  (kept for debugging)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def evaluate(
-    method,
-    examples: List[Dict[str, Any]],
-    max_new_tokens: int = 1024,
-    save_path: Optional[str] = None,
-    resume: bool = True,
-    log_every: int = 10,
-) -> Dict[str, Any]:
-    """Legacy: one method.run() call per question.  Prefer evaluate_batch()."""
-    method_name = method.__class__.__name__
-
-    done_keys, rows, n_correct, n_total, total_elapsed = \
-        _load_completed(save_path) if (resume and save_path) else \
-        (set(), [], 0, 0, 0.0)
-
-    pending = [ex for ex in examples
-               if ex["question"][:200] not in done_keys]
-
-    f_out = None
-    if save_path:
-        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-        f_out = open(save_path, "a", encoding="utf-8")
-
-    pbar = tqdm(pending, desc=f"[{method_name}]", unit="q",
-                dynamic_ncols=True, colour="green")
-    try:
-        for i, ex in enumerate(pbar):
-            q, gold = ex["question"], ex.get("answer")
-            try:
-                res: InferenceResult = method.run(
-                    question=q, gold_answer=gold, max_new_tokens=max_new_tokens
-                )
-            except Exception as e:
-                logger.error(f"[{i}] failed: {e}")
-                from inference_methods import _make_error_result
-                res = _make_error_result(method_name, q, gold, getattr(method,"N",1))
-
-            row = res.to_dict()
-            row["question"] = q[:300]
-            rows.append(row)
-            if res.is_correct is not None:
-                n_correct += int(res.is_correct); n_total += 1
-            total_elapsed += res.elapsed_sec
-            if f_out:
-                f_out.write(json.dumps(row) + "\n"); f_out.flush()
-            if n_total > 0:
-                pbar.set_postfix(acc=f"{n_correct/n_total:.3f}",
-                                 correct=f"{n_correct}/{n_total}", refresh=False)
-            if (i + 1) % log_every == 0:
-                logger.info(f"[{i+1}] acc={n_correct/max(n_total,1):.3f}")
-    finally:
-        pbar.close()
-        if f_out: f_out.close()
-
-    accuracy    = n_correct / max(n_total, 1)
-    avg_elapsed = total_elapsed / max(len(rows), 1)
-    logger.info(f"Final acc={accuracy:.4f} ({n_correct}/{n_total})")
-    return {"accuracy": round(accuracy,4), "n_correct": n_correct,
-            "n_total": n_total, "avg_elapsed_sec": round(avg_elapsed,3),
-            "results": rows}
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # I/O helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -540,24 +397,12 @@ def save_summary(summary: Dict[str, Any], path: str):
     logger.info(f"Summary saved to {path}")
 
 
-def load_jsonl(path: str) -> List[Dict]:
-    rows = []
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    pass
-    return rows
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# Comparison and redundancy
+# Reporting
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compare_methods(summaries: Dict[str, Dict[str, Any]]) -> str:
+    """Plain-text accuracy / timing table across methods."""
     lines = [
         f"\n{'Method':<20} {'Accuracy':>10} {'Correct':>10} "
         f"{'Total':>8} {'Avg time':>10} {'Wall time':>12}",
@@ -574,6 +419,12 @@ def compare_methods(summaries: Dict[str, Dict[str, Any]]) -> str:
 
 
 def redundancy_stats(results: List[Dict]) -> Dict[str, float]:
+    """Vote-group statistics for ``bon_majority`` rows.
+
+    Averages the number of distinct answer groups, the size of the selected
+    group and of the largest group, and how often the selected group is the
+    largest one.
+    """
     n_cl, sel_sz, max_sz, top_sel = [], [], [], []
     for r in results:
         sizes = r.get("cluster_sizes", [])

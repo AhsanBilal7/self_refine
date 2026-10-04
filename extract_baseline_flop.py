@@ -1,66 +1,49 @@
 #!/usr/bin/env python3
 """
-extract_baseline_flop.py
-========================
-Compute theoretical FLOPs for **baseline** inference methods (BoN, DN-BoN,
-Majority Voting, Greedy) from JSONL result files using tiktoken for exact
-token counting of the selected response and a per-question char-to-token
-ratio to estimate tokens for the remaining N-1 candidates.
+Inference-compute (TFLOP) accounting for the baselines run with ``run_eval.py``.
 
-Supported methods
------------------
-  bon             – Best-of-N with PRM selection            (gen × N + PRM × N)
-  dn_bon          – Diversity-normalised BoN with PRM        (gen × N + PRM × N)
-  dn_bon_updated  – DN-BoN updated alpha                     (gen × N + PRM × N)
-  bon_majority    – Best-of-N with majority voting           (gen × N, no PRM)
-  greedy_pass_n   – N samples, log-prob selection            (gen × N, no PRM)
-  greedy          – Single greedy sample                     (gen × 1, no PRM)
+Uses the same formulas as ``extract_compute_flop.py`` (paper "Compute Budget
+and TFLOP Accounting"):
+
+    generation :  2 * P_gen * (T_in + T_out)   per candidate
+    verifier   :  2 * P_rm  * T_in             per candidate (``bon`` only)
+
+Methods (parsed from ``<method>_<dataset>_N<N>.jsonl``)
+-------------------------------------------------------
+  greedy          1 generation call
+  bon_majority    N generation calls                      (Maj@N)
+  greedy_pass_n   N generation calls                      (log-prob selection)
+  bon             N generation calls + N verifier passes   (Best-of-N)
 
 Token counting
 --------------
-Output tokens for the SELECTED response are counted exactly via tiktoken.
-The remaining N-1 responses are not stored as text; only their character
-lengths are available in ``trace_lengths``.  A per-question char-per-token
-ratio is derived from the selected response and applied to estimate token
-counts for all N candidates.
+Only the selected response is stored as text; it is tokenised exactly with
+tiktoken. The other candidates are stored as character lengths
+(``trace_lengths``) and converted to tokens with that question's
+characters-per-token ratio. Rows that only stored the selected response reuse
+its length for all N candidates (``n_fallback_selected_x_N``); rows with
+neither are skipped (``n_skipped_no_data``).
 
-FLOP formula (same as extract_compute_flop.py)
-----------------------------------------------
-  generation :  FLOPs = 2 × P × (T_in + T_out)
-  PRM scoring:  FLOPs = 2 × P_prm × T_in          (prefill-only)
-
-  T_in  = SYSTEM_OVERHEAD_TOKENS + question_tokens   (same for all N)
-  T_out = estimated output tokens per candidate
+``--verifier_params_b`` sets ``P_rm`` and should match the reward model used
+for ``bon`` (7.617 for Qwen2.5-Math-PRM-7B).
 
 Usage
 -----
-    python extract_baseline_flop.py \\
-        --results_dir  experiments_results/results_baselines \\
-        --output_dir   experiments_results/compute_flops_baseline \\
-        --models "Ministral-8B" "Qwen2.5-1.5B" "Qwen2.5-Math-7B" "LLaMA-3.1-8B"
-
-    # Also process dn_bon_updated files
-    python extract_baseline_flop.py --include_dn_bon_updated
+    python extract_baseline_flop.py \
+        --results_dir experiments_results/results_baselines \
+        --output_dir  experiments_results/compute_flops_baseline \
+        [--models "Qwen2.5-Math-7B" "Qwen2.5-1.5B"] [--methods bon bon_majority]
 
 Output
 ------
-Per-model JSON summary:   <output_dir>/<model_folder>/baseline_flop_summary.json
-Master CSV:               <output_dir>/baseline_flop_summary.csv
+    <output_dir>/<model folder>/baseline_flop_summary.json
+    <output_dir>/baseline_flop_summary.csv
 
-CSV columns
------------
-model, dataset, method, N, max_tokens,
-total_tflop_per_question,
-generator_tflop_per_question,
-verifier_tflop_per_question,
-effective_bon_n,
-mean_out_tokens_per_candidate,
-mean_in_tokens,
-total_tflop_all_questions,
-accuracy,
-n_questions,
-gen_params_b,
-tiktoken_encoding
+CSV columns: model, dataset, method, N, max_tokens, total/generator/verifier
+TFLOPs per question, effective_bon_n, mean_out_tokens_per_candidate,
+mean_in_tokens, total_tflop_all_questions, accuracy, n_questions,
+n_skipped_no_data, n_fallback_selected_x_N, gen_params_b, tiktoken_encoding,
+uses_prm.
 """
 
 from __future__ import annotations
@@ -69,7 +52,6 @@ import argparse
 import csv
 import json
 import logging
-import math
 import os
 import re
 from functools import lru_cache
@@ -77,7 +59,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── tiktoken import (required) ────────────────────────────────────────────────
+# ── tiktoken (required) ───────────────────────────────────────────────────────
 try:
     import tiktoken
     _TIKTOKEN_AVAILABLE = True
@@ -103,11 +85,11 @@ MODEL_REGISTRY: Dict[str, Tuple[float, str, str]] = {
     "DeepSeek-R1-Distill-Qwen-7B": (7.617, "DeepSeek-R1-7B",  "cl100k_base"),
 }
 
-VERIFIER_PARAMS_B: float = 7.617   # Qwen2.5-Math-PRM-7B
+VERIFIER_PARAMS_B: float = 7.617   # Qwen2.5-Math-PRM-7B; override with --verifier_params_b
 VERIFIER_ENCODING: str   = "cl100k_base"
 
-# Methods that run a PRM verifier to score all N candidates
-PRM_METHODS = {"bon", "dn_bon", "dn_bon_updated"}
+# Methods that score all N candidates with a verifier
+PRM_METHODS = {"bon"}
 
 # Approximate system-prompt + chat-template overhead in tokens (same constant
 # as extract_compute_flop.py so FLOPs are directly comparable)
@@ -118,10 +100,8 @@ SYSTEM_OVERHEAD_TOKENS: int = 120
 # English mathematical text with LaTeX.
 FALLBACK_CHARS_PER_TOKEN: float = 3.5
 
-# Ordered list of known method prefixes (longest first to avoid prefix clash)
+# Known method prefixes, longest first so "bon_majority" is not read as "bon"
 KNOWN_METHODS = [
-    "dn_bon_updated",
-    "dn_bon",
     "bon_majority",
     "bon",
     "greedy_pass_n",
@@ -182,7 +162,7 @@ def _parse_filename(fname: str) -> Optional[Tuple[str, str, int]]:
     """
     Parse a baseline JSONL filename into (method, dataset, N).
 
-    Accepts: bon_aime24_N8.jsonl, dn_bon_updated_math500_N8.jsonl, etc.
+    Accepts e.g. bon_aime24_N8.jsonl or bon_majority_math500_N8.jsonl.
     Rejects:  files with spaces, _summary.json, non-JSONL, etc.
     Returns None if unparseable.
     """
@@ -249,7 +229,7 @@ def compute_record_flops(
        → selected response tokens counted exactly; replicated × N so that all
          N generation passes are counted fairly.  ``token_source = "selected_x_N"``.
 
-    C) Both absent (old-format records that stored nothing)
+    C) Both absent (rows that stored no text)
        → ``token_source = "no_data"``; caller must skip this record.
 
     ``file_N`` is the N parsed from the filename and is used as a fallback
@@ -355,8 +335,8 @@ def compute_file_flops(
     """
     Aggregate FLOPs over all question records in one JSONL file.
 
-    Records that have neither trace_lengths nor raw_llm_output (old-format
-    ``bestofn`` / ``greedypassn`` entries) are counted but excluded from the
+    Records that have neither trace_lengths nor raw_llm_output are counted
+    but excluded from the
     FLOP averages and accuracy calculation — they are reported separately as
     ``n_skipped_no_data``.
 
@@ -389,7 +369,7 @@ def compute_file_flops(
         )
 
         if rf["token_source"] == _SRC_NO_DATA:
-            # Old-format record with nothing to estimate from — exclude entirely
+            # Nothing to estimate from; exclude the record.
             n_skipped_no_data += 1
             continue
 
@@ -531,7 +511,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
     parser = argparse.ArgumentParser(
-        description="Compute theoretical FLOPs for CIMR baseline methods.",
+        description="TFLOP accounting for baseline result files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -573,14 +553,8 @@ def main() -> None:
         "--methods",
         nargs="*",
         default=None,
-        help="Restrict to specific methods, e.g. 'bon' 'dn_bon'. "
+        help="Restrict to specific methods, e.g. 'bon' 'bon_majority'. "
              "Processes all methods if omitted.",
-    )
-    parser.add_argument(
-        "--include_dn_bon_updated",
-        action="store_true",
-        help="Include dn_bon_updated files (excluded by default to avoid "
-             "double-counting with dn_bon).",
     )
     args = parser.parse_args()
 
@@ -629,10 +603,6 @@ def main() -> None:
                 continue
 
             method, dataset, N = parsed
-
-            # Filter: dn_bon_updated excluded unless flag set
-            if method == "dn_bon_updated" and not args.include_dn_bon_updated:
-                continue
 
             # Filter: user-specified methods
             if args.methods and method not in args.methods:

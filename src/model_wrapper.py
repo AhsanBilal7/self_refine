@@ -1,42 +1,24 @@
-"""
-model_wrapper.py
-----------------
-HuggingFace-backed language model wrapper with full single/multi-GPU support.
+"""Hugging Face causal-LM wrapper shared by every method.
 
-GPU handling
-------------
-Single GPU  (default):
-  device="auto"  →  device_map="auto"  →  model lands on cuda:0
+``_generate_batch_raw`` is the only place ``model.generate()`` is called. It
+left-pads one batch of fully formatted prompts and returns decoded
+completions. The refinement pipeline formats its own role prompts and calls it
+directly; the baselines use the helpers below, which wrap each question in the
+baseline prompt ``MATH_SYSTEM_PROMPT``.
 
-Multiple GPUs  (automatic sharding):
-  device="auto"  →  device_map="auto"  →  transformers shards layers across
-  all GPUs visible in CUDA_VISIBLE_DEVICES automatically.
-  No code change needed; just set CUDA_VISIBLE_DEVICES before running.
+Devices. ``device="auto"`` lets ``device_map="auto"`` place the model on all
+visible GPUs (restrict with ``CUDA_VISIBLE_DEVICES`` / ``--gpus``);
+``"cuda:N"`` pins it to one GPU; ``"cpu"`` is for debugging. 4/8-bit loading
+needs ``bitsandbytes``.
 
-Specific GPU(s):
-  device="cuda:0"   →  single GPU, index 0
-  device="cuda:1"   →  single GPU, index 1
-
-CPU:
-  device="cpu"      →  runs on CPU (slow; for debugging only)
-
-Batching design
----------------
-ONE batch_size argument controls every model.generate() call.
-
-  Greedy:
-    Questions chunked into groups of batch_size.
-    Each chunk → one model.generate() call.
-
-  BoN / DN-BoN (generate_samples_flat generator):
-    Flat list of Q*N prompts chunked by batch_size.
-    Yields (q_idx, traces) as each question's N samples complete.
-    With batch_size=64, N=8  → 8 questions saved per generate() call.
+Batching. ``batch_size`` caps the sequences per ``generate()`` call:
+``generate_greedy_batch`` chunks questions, and ``generate_samples_flat``
+chunks a flat list of ``Q x N`` prompts and yields each question as soon as its
+``N`` samples are done.
 """
 
 import logging
 import math
-import os
 from typing import List, Optional, Dict, Any
 
 import torch
@@ -49,6 +31,7 @@ DEFAULT_TEMPERATURE    = 0.7
 DEFAULT_TOP_P          = 0.95
 DEFAULT_TOP_K          = 50
 
+# System prompt for baseline candidate generation (Greedy / Maj@N / BoN).
 MATH_SYSTEM_PROMPT = (
     "You are a careful mathematics assistant. "
     "Solve the problem step by step and put your final answer in \\boxed{}."
@@ -122,15 +105,16 @@ def _primary_device(model) -> torch.device:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class HFModelWrapper:
-    """
-    HuggingFace causal / seq2seq LM wrapper.
+    """Hugging Face causal (or seq2seq) LM with batched generation helpers.
 
     Parameters
     ----------
-    model_name_or_path : HF Hub model id or local path
-    batch_size         : sequences per model.generate() call
-    device             : "auto" | "cuda" | "cuda:N" | "cpu"
-                         "auto" uses all visible GPUs via device_map="auto"
+    model_name_or_path : Hugging Face Hub id or local path.
+    batch_size         : sequences per ``model.generate()`` call.
+    device             : ``"auto"`` | ``"cuda"`` | ``"cuda:N"`` | ``"cpu"``.
+    max_new_tokens, temperature, top_p, top_k
+                       : defaults used when a call does not override them.
+    system_prompt      : system message for the baseline helpers.
     """
 
     def __init__(
@@ -285,7 +269,7 @@ class HFModelWrapper:
             return f"{self.system_prompt}\n\nProblem: {question}\nSolution:"
         return f"Problem: {question}\nSolution:"
 
-    # ── core generation  (ONLY place model.generate() is called) ─────────────
+    # ── core generation (the only model.generate() call) ─────────────────────
 
     @torch.no_grad()
     def _generate_batch_raw(
@@ -449,7 +433,7 @@ class HFModelWrapper:
     def generate_greedy(self, question: str, max_new_tokens: Optional[int] = None) -> str:
         return self.generate_greedy_batch([question], max_new_tokens=max_new_tokens)[0]
 
-    # ── sequence log-probability scoring (used by GreedyPassN) ───────────────
+    # ── sequence log-probability scoring (used by GreedyPassN) ──────────────
 
     @torch.no_grad()
     def score_sequences_logprob(

@@ -1,33 +1,35 @@
-"""
-clustering.py
--------------
-Semantic clustering of reasoning traces for DN-BoN.
+"""Semantic clustering of reasoning traces (sampling-redundancy analysis).
 
-The SentenceTransformer (or HF AutoModel) is loaded ONCE in ClusterManager.__init__
-and stored as self._st_model / self._hf_model.  The cluster() method is called once
-per question but never reloads the embedding model — it just runs a forward pass on
-the already-loaded model.
+Implements the clustering of the paper's appendix "Sampling Redundancy
+Metrics": each initial rollout is embedded with a sentence encoder
+(``all-MiniLM-L6-v2`` by default), embeddings are unit-normalised, and
+agglomerative clustering with average linkage and cosine distance is cut at
+``1 - tau_sim`` (``tau_sim = 0.85``). ``redundancy_metrics`` turns the cluster
+labels into the realised cluster count R(N), R(N)/N, the dominant-cluster
+mass f_max(N) and the entropy H(N).
 
-If sentence-transformers is unavailable, falls back to a HF AutoModel mean-pool
-encoder, then to lightweight TF-IDF if neither is installed.
+The clustering is analysis-only and does not affect the method's predictions.
+If ``sentence-transformers`` is unavailable, a mean-pooled Hugging Face
+encoder is used, then TF-IDF.
 """
 
 import logging
-import re
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple
+
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Clustering back-ends  (pure numpy / sklearn, no model loading here)
+# Clustering back-ends
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _cluster_agglomerative(
     embeddings: np.ndarray,
     distance_threshold: float,
 ) -> np.ndarray:
+    """Average-linkage agglomerative clustering on cosine distance."""
     from sklearn.cluster import AgglomerativeClustering  # type: ignore
     n = len(embeddings)
     if n == 1:
@@ -45,6 +47,7 @@ def _cluster_threshold_greedy(
     embeddings: np.ndarray,
     similarity_threshold: float,
 ) -> np.ndarray:
+    """Single-pass clustering: join the most similar centroid above threshold."""
     n = len(embeddings)
     labels = -np.ones(n, dtype=int)
     centroids: List[np.ndarray] = []
@@ -133,10 +136,8 @@ def _embed_tfidf(texts: List[str]) -> np.ndarray:
     except ValueError:
         pass
 
-    # Step 4 — absolute fallback: identity-like unit vectors
-    # Each document gets a unique one-hot direction so they are all
-    # maximally distinct (uniqueness γ_i will be ~1/N for everyone,
-    # i.e. no redundancy signal — safe neutral behaviour).
+    # Step 4 — last resort: one-hot unit vectors, so every document is its
+    # own cluster.
     logger.warning(
         "TF-IDF: all documents empty after cleaning; "
         "returning identity-like unit embeddings."
@@ -153,20 +154,18 @@ def _embed_tfidf(texts: List[str]) -> np.ndarray:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ClusterManager:
-    """
-    Semantic clustering of reasoning traces.
+    """Cluster the traces of one problem into reasoning directions.
 
-    The embedding model is loaded ONCE at __init__ time and stored as an
-    instance attribute.  Every call to cluster() reuses the same in-memory
-    model object — no reloading, no re-downloading.
+    The embedding model is loaded once in ``__init__`` and reused by every
+    ``cluster()`` call.
 
     Parameters
     ----------
-    embedding_model    : sentence-transformers model id (e.g. 'all-MiniLM-L6-v2')
-                         or 'tfidf' for the lightweight fallback.
-    similarity_threshold: cosine-similarity cutoff in [0, 1].
-    clustering_method  : 'agglomerative' | 'greedy'
-    use_answer_only    : cluster only the \\boxed{} answer instead of full trace.
+    embedding_model      : sentence-transformers id, or ``'tfidf'``.
+    similarity_threshold : ``tau_sim``; clusters are cut at ``1 - tau_sim``.
+    clustering_method    : ``'agglomerative'`` (paper) or ``'greedy'``.
+    use_answer_only      : embed only the ``\\boxed{}`` answer, not the trace.
+    batch_size           : encoder batch size.
     """
 
     def __init__(
@@ -184,20 +183,16 @@ class ClusterManager:
         self.use_answer_only      = use_answer_only
         self.batch_size           = batch_size   # used by HF AutoModel _embed path
 
-        # These are set once below and reused on every cluster() call
         self._st_model   = None   # SentenceTransformer instance
         self._hf_model   = None   # HF AutoModel instance
         self._hf_tok     = None   # HF AutoTokenizer instance
         self._hf_device  = None
         self._embedder   = self._load_embedder()  # sets the fields above
 
-    # ── model loading  (called ONCE in __init__) ──────────────────────────────
+    # ── model loading ─────────────────────────────────────────────────────────
 
     def _load_embedder(self) -> str:
-        """
-        Load the embedding model once and cache it.
-        Returns a string tag: 'sentence_transformers' | 'hf_transformer' | 'tfidf'.
-        """
+        """Load the encoder; returns 'sentence_transformers' | 'hf_transformer' | 'tfidf'."""
         if self.embedding_model == "tfidf":
             logger.info("ClusterManager: using TF-IDF embedder (no model load).")
             return "tfidf"
@@ -207,7 +202,7 @@ class ClusterManager:
             from sentence_transformers import SentenceTransformer  # type: ignore
             logger.info(
                 f"ClusterManager: loading SentenceTransformer "
-                f"'{self.embedding_model}' — this happens ONCE."
+                f"'{self.embedding_model}'."
             )
             self._st_model = SentenceTransformer(self.embedding_model)
             logger.info("ClusterManager: SentenceTransformer ready.")
@@ -225,7 +220,7 @@ class ClusterManager:
             from transformers import AutoTokenizer, AutoModel  # type: ignore
             logger.info(
                 f"ClusterManager: loading HF AutoModel "
-                f"'{self.embedding_model}' — this happens ONCE."
+                f"'{self.embedding_model}'."
             )
             self._hf_tok    = AutoTokenizer.from_pretrained(self.embedding_model)
             self._hf_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -263,7 +258,6 @@ class ClusterManager:
         ]
 
         if self._embedder == "sentence_transformers":
-            # _st_model is already in memory from __init__
             try:
                 return self._st_model.encode(
                     safe_texts,
@@ -309,17 +303,14 @@ class ClusterManager:
     def _get_texts_to_embed(self, traces: List[str]) -> List[str]:
         if not self.use_answer_only:
             return traces
-        from verifier import extract_boxed_answer  # type: ignore
+        from .verifier import extract_boxed_answer
         return [extract_boxed_answer(t) or t for t in traces]
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def cluster(self, traces: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Cluster traces into semantic reasoning directions.
-
-        Called once per question.  The embedding model is NOT reloaded here —
-        it was loaded once in __init__ and is reused every call.
+        Cluster the traces of one problem into reasoning directions.
 
         Returns
         -------
@@ -349,3 +340,26 @@ class ClusterManager:
         cluster_sizes  = np.array([size_map[int(l)] for l in labels], dtype=int)
 
         return labels, cluster_sizes
+
+
+def redundancy_metrics(labels: np.ndarray) -> Dict[str, float]:
+    """Sampling-redundancy statistics for the cluster labels of N rollouts.
+
+    Returns ``R`` (realised clusters), ``R_over_N``, ``f_max`` (largest
+    cluster mass), ``H`` (entropy in bits) and ``H_norm`` (``H / log2 N``).
+    """
+    labels = np.asarray(labels)
+    N = len(labels)
+    if N == 0:
+        return dict(R=0, R_over_N=0.0, f_max=1.0, H=0.0, H_norm=0.0, N=0)
+    _, counts = np.unique(labels, return_counts=True)
+    p = counts / N
+    H = float(-np.sum(p * np.log2(p + 1e-12)))
+    return dict(
+        R=int(len(counts)),
+        R_over_N=float(len(counts) / N),
+        f_max=float(counts.max() / N),
+        H=H,
+        H_norm=float(H / np.log2(N)) if N > 1 else 0.0,
+        N=N,
+    )

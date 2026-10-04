@@ -1,22 +1,21 @@
 % plot_cimr_metrics.m
 % ===================
-% Paper-quality MATLAB plots for CIMR analysis (EMNLP submission).
-% Formatted for IEEE/ACM double-column papers (full text width = 17.8 cm).
+% Refinement-dynamics figures for breadth-depth refinement (N=8, D=4),
+% sized for a double-column paper (full text width 17.8 cm).
 %
-% Requires the three CSVs produced by export_paper_csvs.py:
+% Inputs: the three CSVs written by export_paper_csvs.py
 %   experiments_results/paper_csvs/depth_accuracy_metrics.csv
 %   experiments_results/paper_csvs/correction_effectiveness.csv
 %   experiments_results/paper_csvs/diversity.csv
 %
-% Outputs four vector-PDF figures to experiments_results/paper_figures/
-%   fig1_recovery_regression.pdf      — 2-panel: shared top legend
-%   fig2_correction_effectiveness.pdf — 4-panel: shared top legend
-%   fig3_diversity.pdf                — 2-panel: shared top legend
-%   fig4_heatmaps.pdf                 — 2-panel: model names as row labels
+% Outputs (vector PDF) in experiments_results/paper_figures/
+%   fig1_recovery_regression.pdf      recovery rho_rec(d) and regression rho_reg(d)
+%   fig2_correction_effectiveness.pdf answer change mu_Delta(d), net benefit B(d),
+%                                     W->C and C->W flip rates
+%   fig3_diversity.pdf                terminal rollout diversity and agreement U(d)
+%   fig4_heatmaps.pdf                 per-dataset recovery and net benefit (d >= 2)
 %
-% Shared horizontal legends sit above all panels (lgd.Layout.Tile = 'north').
-% Requires MATLAB R2020b+ for tiledlayout north-tile legends.
-% exportgraphics() requires R2020a+; older versions fall back to print().
+% Requires MATLAB R2020b+ (tiledlayout legends; exportgraphics from R2020a).
 % -------------------------------------------------------------------------
 
 clear; clc; close all;

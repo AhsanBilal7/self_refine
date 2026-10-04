@@ -1,36 +1,30 @@
 #!/usr/bin/env python3
 """
-export_paper_csvs.py
-====================
-Read the pre-computed metrics_summary.json files and export three tidy CSV
-files that feed directly into the MATLAB paper plots.
+Export the refinement-dynamics CSVs used by ``plot_cimr_metrics.m``.
 
-Target models  : Qwen2.5-Math-7B, Qwen2.5-1.5B, Ministral-8B, LLaMA-3.1-8B
-Target config  : N=8, D=4  (no-critique ablations excluded)
+Reads the ``metrics_summary.json`` files written by ``extract_cimr_metrics.py``
+for the four paper models (Qwen2.5-Math-7B, Qwen2.5-1.5B, Ministral-8B,
+LLaMA-3.1-8B) at N=8, D=4 with the full pipeline (``_no_critique`` files are
+excluded), and writes three tidy CSVs to ``--output_dir``:
 
-Output CSVs (saved to --output_dir, default: experiments_results/paper_csvs/)
-────────────────────────────────────────────────────────────────────────────
-depth_accuracy_metrics.csv
-    model, dataset, depth,
-    improvement_rate, recovery_rate, regression_rate
+depth_accuracy_metrics.csv     per model, dataset, depth
+    improvement_rate (Delta A(d)), recovery_rate (rho_rec), regression_rate (rho_reg)
 
-correction_effectiveness.csv
-    model, dataset, depth,
-    answer_change_rate,
-    flip_wrong_to_correct, flip_correct_to_wrong, flip_wrong_to_wrong,
-    net_correction_benefit
+correction_effectiveness.csv   per model, dataset, depth
+    answer_change_rate (mu_Delta), flip_wrong_to_correct (mu_{W->C}),
+    flip_correct_to_wrong (mu_{C->W}), flip_wrong_to_wrong,
+    net_correction_benefit (B(d))
 
-diversity.csv
-    model, dataset,
-    mean_n_unique_final_answers, frac_questions_diverse,
+diversity.csv                  per model, dataset
+    mean_n_unique_final_answers, frac_questions_diverse (terminal diversity),
     mean_final_prm_std, mean_final_prm_range,
-    depth_1_agreement, depth_2_agreement, depth_3_agreement, depth_4_agreement
+    depth_<d>_agreement (U(d)) for d = 1..4
 
 Usage
 -----
-    python export_paper_csvs.py                          # use defaults
-    python export_paper_csvs.py --metrics_dir experiments_results/cimr_metrics \
-                                --output_dir  experiments_results/paper_csvs
+    python export_paper_csvs.py \
+        [--metrics_dir experiments_results/cimr_metrics] \
+        [--output_dir  experiments_results/paper_csvs]
 """
 
 from __future__ import annotations
@@ -43,7 +37,7 @@ from typing import Any, Dict, List
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-# Map folder prefix → short display name for plots / CSV
+# Result-folder prefix -> display name used in the CSVs and figures
 MODEL_MAP: Dict[str, str] = {
     "Qwen2.5-Math-7B-Instruct": "Qwen2.5-Math-7B",
     "Qwen2.5-1.5B-Instruct":    "Qwen2.5-1.5B",
@@ -87,7 +81,7 @@ def _write_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Export paper CSVs from CIMR metrics.")
+    parser = argparse.ArgumentParser(description="Export refinement-dynamics CSVs for plotting.")
     parser.add_argument(
         "--metrics_dir",
         default="experiments_results/cimr_metrics",
@@ -107,7 +101,7 @@ def main() -> None:
     for folder in sorted(os.listdir(args.metrics_dir)):
         short_name = _match_model(folder)
         if short_name is None:
-            continue                                    # skip non-target models
+            continue
 
         summary_path = os.path.join(args.metrics_dir, folder, "metrics_summary.json")
         if not os.path.isfile(summary_path):
@@ -118,7 +112,7 @@ def main() -> None:
             summary: Dict[str, Any] = json.load(f)
 
         for key, entry in summary.items():
-            # filter: must be N8_d4 and not an ablation
+            # Only the N=8, D=4 full-pipeline runs.
             if not key.endswith(FILE_SUFFIX):
                 continue
             if EXCLUDE_TAG in key:

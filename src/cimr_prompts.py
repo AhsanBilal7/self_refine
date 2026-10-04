@@ -1,27 +1,37 @@
-"""
-cimr_prompts.py
-===============
-Prompt builders for the CIMR pipeline.
+"""Role prompts for breadth-depth refinement (paper Appendix "Role Prompts").
 
-All prompts are self-contained — no few-shot examples, no cached content.
-Every prompt is built fresh from (question, prior_corrected) only.
+One base model plays three roles that differ only in their prompt:
 
-Pipeline structure per rollout:
-  depth 1  → generate initial reasoning from question alone
-  depth 2..d → extend/refine using the corrected trace from the prior depth
+* generator ``pi^G`` -- the initial rollout ``r_i^(0)`` and the reasoning
+  continuation ``g_i^(d) ~ pi^G(. | x, r_i^(d-1))`` (Eq. reasoning);
+* critic ``pi^C`` -- the critique ``c_i^(d) ~ pi^C(. | x, g_i^(d))``
+  (Eq. critique);
+* corrector ``pi^R`` -- the corrected trace
+  ``r_i^(d) ~ pi^R(. | x, g_i^(d), c_i^(d))`` (Eq. correction).
 
-Between every generation:
-  self-critique  → identify specific errors in the current trace
-  self-correction → produce a corrected trace that fixes those errors
+All prompts are zero-shot and built only from the problem and the traces of
+the current rollout. The prompt text is reproduced verbatim in the paper, so
+edits here must be mirrored there.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Optional
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    """Keep the head and tail of ``text`` when it exceeds ``max_chars``."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    keep = max_chars // 2
+    head = text[:keep].rstrip()
+    tail = text[-keep:].lstrip()
+    omitted = len(text) - max_chars
+    return f"{head}\n\n[... {omitted:,} characters omitted ...]\n\n{tail}"
+
 
 # ---------------------------------------------------------------------------
-# System prompts
+# System prompts (one per role)
 # ---------------------------------------------------------------------------
 
 REASONING_SYSTEM_PROMPT = (
@@ -53,11 +63,11 @@ CORRECTION_SYSTEM_PROMPT = (
 
 
 # ---------------------------------------------------------------------------
-# Reasoning prompts
+# Generator: initial rollout and reasoning continuation
 # ---------------------------------------------------------------------------
 
 def build_initial_reasoning_prompt(question: str) -> str:
-    """Prompt for depth-1 reasoning generation (seed step)."""
+    """User prompt for the initial rollout, conditioned on the problem only."""
     q = (question or "").strip()
     return (
         "Solve the following problem step by step.\n\n"
@@ -77,28 +87,22 @@ def build_continuation_reasoning_prompt(
     total_steps: int,
     max_prior_chars: int = 3000,
 ) -> str:
-    """Prompt for depths 2..d — extend/refine the prior corrected trace.
+    """User prompt for reasoning continuation ``g^(d) ~ pi^G(. | x, r^(d-1))``.
 
     Parameters
     ----------
-    question        : the original problem (unchanged across all depths).
-    prior_corrected : the corrected trace from depth k-1.
-    step_idx        : current depth index (>= 2).
-    total_steps     : total depth d.
-    max_prior_chars : truncation budget for prior_corrected.
+    question        : the input problem ``x``.
+    prior_corrected : the corrected trace ``r^(d-1)`` from the previous depth.
+    step_idx        : current refinement depth ``d`` (>= 2).
+    total_steps     : total refinement depth ``D``.
+    max_prior_chars : character budget for ``r^(d-1)`` (head + tail kept).
     """
     q = (question or "").strip()
     prior = (prior_corrected or "").strip()
 
-    # Truncate prior if needed (head + tail).
-    if max_prior_chars > 0 and len(prior) > max_prior_chars:
-        keep = max_prior_chars // 2
-        head = prior[:keep].rstrip()
-        tail = prior[-keep:].lstrip()
-        omitted = len(prior) - max_prior_chars
-        prior = f"{head}\n\n[... {omitted:,} characters omitted ...]\n\n{tail}"
+    prior = _truncate_middle(prior, max_prior_chars)
 
-    # Find last step number so we continue numbering naturally.
+    # Continue the step numbering of the prior trace.
     step_nums = re.findall(r"^Step\s+(\d+)\s*:", prior, re.MULTILINE | re.IGNORECASE)
     last_num = int(step_nums[-1]) if step_nums else (step_idx - 1)
     next_num = last_num + 1
@@ -129,7 +133,7 @@ def build_continuation_reasoning_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Self-critique prompt
+# Critic
 # ---------------------------------------------------------------------------
 
 def build_self_critique_prompt(
@@ -138,24 +142,22 @@ def build_self_critique_prompt(
     trace_answer: str,
     max_trace_chars: int = 3000,
 ) -> str:
-    """Ask the model to critique the reasoning trace for the given problem.
+    """User prompt for self-critique ``c^(d) ~ pi^C(. | x, g^(d))``.
+
+    The critic points to the erroneous step or replies with the fixed
+    confirmation phrase ``The solution appears correct.``
 
     Parameters
     ----------
-    question        : the original problem.
-    trace_text      : the reasoning trace to critique.
-    trace_answer    : the answer extracted from the trace.
-    max_trace_chars : truncation budget.
+    question        : the input problem ``x``.
+    trace_text      : the reasoning trace ``g^(d)`` to critique.
+    trace_answer    : the answer extracted from ``g^(d)``.
+    max_trace_chars : character budget for ``g^(d)`` (head + tail kept).
     """
     q = (question or "").strip()
     trace = (trace_text or "").strip()
 
-    if max_trace_chars > 0 and len(trace) > max_trace_chars:
-        keep = max_trace_chars // 2
-        head = trace[:keep].rstrip()
-        tail = trace[-keep:].lstrip()
-        omitted = len(trace) - max_trace_chars
-        trace = f"{head}\n\n[... {omitted:,} characters omitted ...]\n\n{tail}"
+    trace = _truncate_middle(trace, max_trace_chars)
 
     ans_line = f"Extracted answer: {trace_answer}" if trace_answer else "Extracted answer: (none found)"
 
@@ -176,7 +178,7 @@ def build_self_critique_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Self-correction prompt
+# Corrector
 # ---------------------------------------------------------------------------
 
 def build_self_correction_prompt(
@@ -187,27 +189,26 @@ def build_self_correction_prompt(
     max_trace_chars: int = 3000,
     max_critique_chars: int = 1000,
 ) -> str:
-    """Produce a corrected solution based on the critique.
+    """User prompt for self-correction ``r^(d) ~ pi^R(. | x, g^(d), c^(d))``.
+
+    When ``critique_text`` is empty (the ``--no_critique`` ablation), a fixed
+    placeholder line is shown in the CRITIQUE slot instead.
 
     Parameters
     ----------
-    question          : the original problem.
-    trace_text        : the reasoning trace to correct.
-    critique_text     : the critique identifying errors.
-    trace_answer      : original answer from the trace.
-    max_trace_chars   : truncation budget for trace.
-    max_critique_chars: truncation budget for critique.
+    question           : the input problem ``x``.
+    trace_text         : the reasoning trace ``g^(d)`` to correct.
+    critique_text      : the critique ``c^(d)``; empty under ``--no_critique``.
+    trace_answer       : the answer extracted from ``g^(d)`` (not shown in the
+                         prompt; kept for a uniform builder signature).
+    max_trace_chars    : character budget for ``g^(d)`` (head + tail kept).
+    max_critique_chars : character budget for ``c^(d)`` (head kept).
     """
     q = (question or "").strip()
     trace = (trace_text or "").strip()
     critique = (critique_text or "").strip()
 
-    if max_trace_chars > 0 and len(trace) > max_trace_chars:
-        keep = max_trace_chars // 2
-        head = trace[:keep].rstrip()
-        tail = trace[-keep:].lstrip()
-        omitted = len(trace) - max_trace_chars
-        trace = f"{head}\n\n[... {omitted:,} characters omitted ...]\n\n{tail}"
+    trace = _truncate_middle(trace, max_trace_chars)
 
     if max_critique_chars > 0 and len(critique) > max_critique_chars:
         critique = critique[:max_critique_chars].rstrip() + "\n[critique truncated]"

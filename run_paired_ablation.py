@@ -1,35 +1,37 @@
-"""
-run_paired_ablation.py
-======================
-Rollout-based CIMR pipeline harness.
+"""Run breadth-depth refinement on one benchmark.
 
-Pipeline (per question)
------------------------
-  N independent rollouts × d steps each:
-    step k: generate → [critique] → [correction] → PRM-score
-  Aggregate across rollouts via majority vote and max-PRM.
+For each problem: sample N rollouts, refine each for D rounds of reasoning
+continuation -> self-critique -> self-correction, and take a plurality vote
+over the terminal answers (paper Algorithm 1). Also reports the diagnostic
+max-PRM selection over the same rollouts.
 
-Ablation flags
---------------
-  --no_critique    skip self-critique (Phase B); correction sees empty critique
-  --no_correction  skip self-correction (Phase C); raw reasoning is final trace
+Ablations
+---------
+  --no_critique    the corrector receives an empty critique (w/o-critic row)
+  --no_correction  the corrector is skipped; r^(d) = g^(d)
+  --no_prm         do not load the PRM; diagnostic scores are 0 and vote ties
+                   fall back to rollout order
 
-Output filenames encode N, d, and active ablations:
-  summary_paired_amc23_N8_d4.json
-  summary_paired_amc23_N8_d4_no_critique.json
-  summary_paired_amc23_N8_d4_no_correction.json
+Outputs (in --output_dir), tagged <dataset>_N<N>_d<D>[_no_critique][_no_correction]
+--------------------------------------------------------------------------------
+  cimr_full_results_<tag>.json   full per-question / rollout / step store
+                                 (resumable; the input to the analysis scripts)
+  summary_paired_<tag>.json      accuracy of cimr_majority and cimr_max_prm
+  results_paired_<tag>.jsonl     one prediction record per question
+
+Example
+-------
+  python run_paired_ablation.py --model Qwen/Qwen2.5-Math-7B-Instruct \\
+      --dataset amc23 --cimr_n_rollouts 8 --cimr_depth 4 --output_dir out/
 """
 
 import argparse
 import json
 import logging
-import math
 import os
-import time
-from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-import numpy as np
+from src.dataset_loader import DATASETS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +40,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("paired_ablation")
 
+SELECTION_RULES = ("majority", "max_prm")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -45,399 +49,98 @@ logger = logging.getLogger("paired_ablation")
 
 def parse_args():
     p = argparse.ArgumentParser(
+        description=__doc__.split("\n\n")[0],
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    g = p.add_argument_group("Model / Verifier")
-    g.add_argument("--model", required=True)
-    g.add_argument("--verifier_model",  default="Qwen/Qwen2.5-Math-PRM-7B")
-    g.add_argument("--prm_aggregation", default="min", choices=["min", "mean", "last"])
-    g.add_argument("--embedding_model", default="all-MiniLM-L6-v2")
-    g.add_argument("--batch_size",      type=int, default=8)
-    g.add_argument("--dtype",           default="auto",
+    g = p.add_argument_group("Model")
+    g.add_argument("--model", required=True, help="Hugging Face model id or local path")
+    g.add_argument("--batch_size", type=int, default=8,
+                   help="Sequences per generate() call")
+    g.add_argument("--dtype", default="auto",
                    choices=["auto", "float16", "bfloat16", "float32"])
-    g.add_argument("--device",          default="auto")
-    g.add_argument("--gpus",            default=None)
-    g.add_argument("--load_in_4bit",    action="store_true")
-    g.add_argument("--load_in_8bit",    action="store_true")
+    g.add_argument("--device", default="auto")
+    g.add_argument("--gpus", default=None, help="Sets CUDA_VISIBLE_DEVICES, e.g. '0,1'")
+    g.add_argument("--load_in_4bit", action="store_true")
+    g.add_argument("--load_in_8bit", action="store_true")
     g.add_argument("--trust_remote_code", action="store_true")
-    g.add_argument("--hf_cache_dir",    default=None)
+    g.add_argument("--hf_cache_dir", default=None)
 
-    g = p.add_argument_group("Generation (baselines)")
-    g.add_argument("--N",              type=int,   default=8)
-    g.add_argument("--max_new_tokens", type=int,   default=2048)
-    g.add_argument("--temperature",    type=float, default=0.7)
-    g.add_argument("--top_p",          type=float, default=0.95)
+    g = p.add_argument_group("Diagnostic PRM (not used by the method)")
+    g.add_argument("--verifier_model", default="Qwen/Qwen2.5-Math-PRM-7B")
+    g.add_argument("--prm_aggregation", default="min", choices=["min", "mean", "last"])
+    g.add_argument("--no_prm", action="store_true",
+                   help="Skip loading the PRM entirely")
 
     g = p.add_argument_group("Dataset")
-    g.add_argument("--dataset", required=True,
-                   choices=["math500", "aime24", "aime25", "amc23", "gsm8k",
-                            "olympiadbench", "college_math", "minerva_math",
-                            "mmlu", "custom"])
-    g.add_argument("--split",       default=None)
+    g.add_argument("--dataset", required=True, choices=DATASETS)
+    g.add_argument("--split", default=None)
     g.add_argument("--max_samples", type=int, default=None)
     g.add_argument("--custom_path", default=None)
 
-    g = p.add_argument_group("Ablation grids")
-    g.add_argument("--alpha_values", nargs="+", type=float,
-                   default=[0.0, 0.25, 0.5, 0.75, 1.0])
-    g.add_argument("--tau_values",   nargs="+", type=float,
-                   default=[0.70, 0.80, 0.85, 0.90, 0.95])
-    g.add_argument("--clustering_method", default="agglomerative",
-                   choices=["agglomerative", "greedy"])
-
-    g = p.add_argument_group("CIMR — rollouts × steps")
-    g.add_argument("--cimr_n_rollouts", type=int, default=8)
-    g.add_argument("--cimr_depth",      type=int, default=4)
-    g.add_argument("--cimr_other_answer_aware", action="store_true")
-
-    g.add_argument("--no_critique",   action="store_true",
-                   help="Ablation: skip self-critique phase (Phase B)")
+    g = p.add_argument_group("Breadth-depth refinement")
+    g.add_argument("--cimr_n_rollouts", type=int, default=8, help="Breadth N")
+    g.add_argument("--cimr_depth", type=int, default=4, help="Depth D")
+    g.add_argument("--no_critique", action="store_true",
+                   help="Ablation: skip self-critique")
     g.add_argument("--no_correction", action="store_true",
-                   help="Ablation: skip self-correction phase (Phase C)")
-
-    g.add_argument("--cimr_reasoning_max_new_tokens", type=int,   default=2048)
-    g.add_argument("--cimr_reasoning_temperature",    type=float, default=0.7)
-    g.add_argument("--cimr_reasoning_top_p",          type=float, default=0.95)
-    g.add_argument("--cimr_critique_max_tokens",      type=int,   default=384)
-    g.add_argument("--cimr_critique_max_trace_chars", type=int,   default=4000)
-    g.add_argument("--cimr_correction_max_tokens",         type=int, default=1024)
-    g.add_argument("--cimr_correction_max_trace_chars",    type=int, default=4000)
+                   help="Ablation: skip self-correction")
+    g.add_argument("--cimr_reasoning_max_new_tokens", type=int, default=2048)
+    g.add_argument("--cimr_reasoning_temperature", type=float, default=0.7,
+                   help="Rollout sampling temperature (depth 1)")
+    g.add_argument("--cimr_reasoning_top_p", type=float, default=0.95)
+    g.add_argument("--cimr_critique_max_tokens", type=int, default=384)
+    g.add_argument("--cimr_critique_max_trace_chars", type=int, default=4000)
+    g.add_argument("--cimr_correction_max_tokens", type=int, default=1024)
+    g.add_argument("--cimr_correction_max_trace_chars", type=int, default=4000)
     g.add_argument("--cimr_correction_max_critique_chars", type=int, default=1500)
-    g.add_argument("--cimr_continuation_max_prior_chars",  type=int, default=4000)
-
-    g = p.add_argument_group("Cache / resume")
-    g.add_argument("--load_cache",     default=None)
-    g.add_argument("--save_traces",    action="store_true", default=True)
-    g.add_argument("--no_save_traces", dest="save_traces", action="store_false")
-    g.add_argument("--skip_baselines", action="store_true")
+    g.add_argument("--cimr_continuation_max_prior_chars", type=int, default=4000)
 
     g = p.add_argument_group("Output")
     g.add_argument("--output_dir", default="./results_paired")
-    g.add_argument("--log_every",  type=int, default=10)
-    g.add_argument("--no_plots",   action="store_true")
+    g.add_argument("--log_every", type=int, default=10,
+                   help="Write the summary and log accuracy every K questions")
 
     return p.parse_args()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Diversity metrics + majority helper
+# Accuracy summary
 # ─────────────────────────────────────────────────────────────────────────────
 
-def diversity_metrics(labels: np.ndarray) -> Dict[str, float]:
-    N = len(labels)
-    if N == 0:
-        return dict(H=0.0, He=0.0, fmax=1.0, r=0.0, M=0, N=0)
-    unique, counts = np.unique(labels, return_counts=True)
-    M = int(len(unique))
-    pm = counts / N
-    H = float(-np.sum(pm * np.log2(pm + 1e-12)))
-    He = float(H / math.log2(N)) if N > 1 else 0.0
-    fmax = float(counts.max() / N)
-    r = float(M / N)
-    return dict(H=H, He=He, fmax=fmax, r=r, M=M, N=N)
-
-
-def _majority_select(
-    answers: List[str], ev, data_name: str,
-) -> Tuple[int, str, List[int]]:
-    groups: List[List[int]] = []
-    group_rep: List[str] = []
-    for idx, ans in enumerate(answers):
-        placed = False
-        for g, rep in enumerate(group_rep):
-            try:
-                equiv = ev.check_answers_equiv(ans, rep) if ev is not None else None
-            except Exception:
-                equiv = None
-            if equiv is None:
-                equiv = (str(ans).strip() == str(rep).strip())
-            if equiv:
-                groups[g].append(idx)
-                placed = True
-                break
-        if not placed:
-            groups.append([idx])
-            group_rep.append(ans)
-    if not groups:
-        return 0, "", [1]
-    majority_g = max(range(len(groups)), key=lambda g: len(groups[g]))
-    best_idx = groups[majority_g][0]
-    majority_ans = group_rep[majority_g]
-    vote_counts = [0] * len(answers)
-    for g, members in enumerate(groups):
-        for idx in members:
-            vote_counts[idx] = len(members)
-    return best_idx, majority_ans, vote_counts
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cache-driven baseline methods (BoN / Majority / Oracle / DN-BoN)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def apply_baseline_methods(
-    question:    str,
-    gold:        Optional[str],
-    traces:      List[str],
-    prm_scores:  np.ndarray,
-    all_correct: List[bool],
-    alpha_values: List[float],
-    tau_values:   List[float],
-    cluster_manager,
-    ev,
-    data_name:   str,
-) -> Dict[str, Any]:
-    N = len(traces)
-    answers: List[str] = []
-    for t in traces:
-        try:
-            from src.inference_methods import _extract_pred  # type: ignore
-            ans = _extract_pred(t, ev, data_name)
-        except Exception:
-            ans = ""
-        answers.append(ans)
-
-    results: Dict[str, Any] = {}
-
-    bon_idx = int(np.argmax(prm_scores))
-    bon_correct = bool(all_correct[bon_idx]) if bon_idx < len(all_correct) else False
-    results["bon"] = dict(
-        method="bon", selected_idx=bon_idx, predicted_answer=answers[bon_idx],
-        is_correct=bon_correct, raw_score=float(prm_scores[bon_idx]),
-        norm_score=float(prm_scores[bon_idx]), cluster_size=1, alpha=0.0, tau=float("nan"),
-    )
-
-    correct_idxs = [i for i, c in enumerate(all_correct) if c]
-    if correct_idxs:
-        oracle_idx = int(max(correct_idxs, key=lambda i: prm_scores[i]))
-        oracle_correct = True
-    else:
-        oracle_idx = bon_idx
-        oracle_correct = False
-    results["oracle"] = dict(
-        method="oracle", selected_idx=oracle_idx,
-        predicted_answer=answers[oracle_idx], is_correct=oracle_correct,
-        raw_score=float(prm_scores[oracle_idx]), norm_score=float(prm_scores[oracle_idx]),
-        cluster_size=1, alpha=float("nan"), tau=float("nan"),
-    )
-
-    maj_idx, maj_ans, vote_counts = _majority_select(answers, ev, data_name)
-    maj_correct = bool(all_correct[maj_idx]) if maj_idx < len(all_correct) else False
-    results["majority"] = dict(
-        method="majority", selected_idx=maj_idx, predicted_answer=maj_ans,
-        is_correct=maj_correct, raw_score=float(vote_counts[maj_idx]),
-        norm_score=float(vote_counts[maj_idx]), cluster_size=int(vote_counts[maj_idx]),
-        alpha=float("nan"), tau=float("nan"),
-    )
-
-    for tau in tau_values:
-        try:
-            cluster_manager.similarity_threshold = tau
-            cluster_manager.distance_threshold = 1.0 - tau
-            labels, cluster_sizes = cluster_manager.cluster(traces)
-        except Exception as e:
-            logger.warning(f"Clustering failed (τ={tau}): {e}")
-            labels = np.arange(N, dtype=int)
-            cluster_sizes = np.ones(N, dtype=int)
-        div = diversity_metrics(labels)
-
-        for alpha in alpha_values:
-            if alpha == 0.0:
-                norm_scores = prm_scores.copy()
-            else:
-                safe_sizes = np.maximum(cluster_sizes.astype(float), 1.0)
-                norm_scores = prm_scores / (safe_sizes ** alpha)
-            best_idx = int(np.argmax(norm_scores))
-            is_correct = (
-                bool(all_correct[best_idx]) if best_idx < len(all_correct) else False
-            )
-            key = f"dn_bon_tau{tau:.2f}_alpha{alpha:.2f}"
-            results[key] = dict(
-                method=key, selected_idx=best_idx,
-                predicted_answer=answers[best_idx], is_correct=is_correct,
-                raw_score=float(prm_scores[best_idx]),
-                norm_score=float(norm_scores[best_idx]),
-                cluster_size=int(cluster_sizes[best_idx]),
-                alpha=alpha, tau=tau,
-                fmax=div["fmax"], H=div["H"], He=div["He"],
-                M=div["M"], r=div["r"], n_clusters=div["M"],
-                cluster_labels=labels.tolist(),
-            )
-
-    default_tau = tau_values[len(tau_values) // 2]
-    default_key = f"dn_bon_tau{default_tau:.2f}_alpha0.50"
-    if default_key in results:
-        labels = np.array(results[default_key]["cluster_labels"])
-        bon_cluster_id = int(labels[bon_idx]) if bon_idx < len(labels) else -1
-        dominant_cid = int(np.bincount(labels).argmax()) if labels.size > 0 else -1
-        bon_in_dominant = (bon_cluster_id == dominant_cid)
-        correct_outside_dominant = any(
-            (i < len(all_correct) and all_correct[i]
-             and i < len(labels) and int(labels[i]) != dominant_cid)
-            for i in range(N)
-        )
-        dnbon_rescued = (
-            not bon_correct and results.get(default_key, {}).get("is_correct", False)
-        )
-        dnbon_hurt = (
-            bon_correct and not results.get(default_key, {}).get("is_correct", True)
-        )
-    else:
-        bon_in_dominant = False
-        correct_outside_dominant = False
-        dnbon_rescued = False
-        dnbon_hurt = False
-
-    results["__meta__"] = dict(
-        N=N, any_correct=len(correct_idxs) > 0,
-        n_correct_traces=len(correct_idxs),
-        answers=answers, all_correct=all_correct,
-        bon_idx=bon_idx, bon_correct=bon_correct,
-        oracle_correct=oracle_correct, majority_correct=maj_correct,
-        bon_in_dominant_cluster=bon_in_dominant,
-        correct_exists_outside_dominant=correct_outside_dominant,
-        multiplicity_bias_fired=(bon_in_dominant and correct_outside_dominant and not bon_correct),
-        dnbon_rescued=dnbon_rescued, dnbon_hurt=dnbon_hurt,
-        default_tau=default_tau,
-    )
-    return results
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Generation + scoring (one-time)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def generate_and_score(
-    examples: List[Dict[str, Any]],
-    model, verifier, ev,
-    data_name: str, N: int,
-    max_new_tokens: int, temperature: float, top_p: float,
-    cache_path: Optional[str],
-    log_every: int = 10,
-) -> List[Dict[str, Any]]:
-    from src.verifier import score_candidates  # type: ignore
-    records = []
-    t_total = time.time()
-    cache_f = open(cache_path, "w", encoding="utf-8") if cache_path else None
-    for i, ex in enumerate(examples):
-        q    = ex["question"]
-        gold = ex.get("answer", None)
-        qid  = ex.get("id", str(i))
-        try:
-            t0 = time.time()
-            traces = model.generate_samples(
-                q, N=N, temperature=temperature, top_p=top_p,
-                max_new_tokens=max_new_tokens,
-            )
-            gen_elapsed = time.time() - t0
-            prm_scores = (
-                score_candidates(traces, verifier, gold, question=q).tolist()
-                if traces else []
-            )
-            from src.inference_methods import _extract_pred, _check_correct  # type: ignore
-            answers = [_extract_pred(t, ev, data_name) for t in traces]
-            all_correct = (
-                [bool(_check_correct(a, gold, ev, data_name)) for a in answers]
-                if gold is not None else []
-            )
-            rec = dict(
-                id=qid, question=q, gold_answer=gold,
-                traces=traces, prm_scores=prm_scores,
-                answers=answers, all_correct=all_correct,
-                gen_elapsed_sec=gen_elapsed,
-            )
-        except Exception as e:
-            logger.error(f"Generation failed q[{i}]: {e}")
-            rec = dict(
-                id=qid, question=q, gold_answer=gold,
-                traces=[], prm_scores=[], answers=[], all_correct=[],
-                gen_elapsed_sec=0.0, error=str(e),
-            )
-        records.append(rec)
-        if cache_f is not None:
-            cache_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            cache_f.flush()
-        if (i + 1) % log_every == 0 or (i + 1) == len(examples):
-            elapsed = time.time() - t_total
-            rate = (i + 1) / max(elapsed, 1e-6)
-            logger.info(
-                f"  generated {i + 1}/{len(examples)}  "
-                f"elapsed={elapsed:.1f}s  rate={rate:.2f} q/s"
-            )
-    if cache_f is not None:
-        cache_f.close()
-    return records
-
-
-def load_cache(path: str) -> List[Dict[str, Any]]:
-    records: List[Dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except Exception:
-                continue
-    return records
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Aggregation across questions
-# ─────────────────────────────────────────────────────────────────────────────
-
-def aggregate_results(all_qr: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize(question_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Accuracy per selection rule over questions with a correctness label."""
     summary: Dict[str, Any] = {}
-    method_keys = set()
-    for qr in all_qr:
-        for k in qr.keys():
-            if k.startswith("__"):
-                continue
-            method_keys.add(k)
-    for k in sorted(method_keys):
-        n_total = 0; n_correct = 0
-        for qr in all_qr:
-            entry = qr.get(k)
-            if not isinstance(entry, dict):
-                continue
-            ic = entry.get("is_correct")
-            if ic is None:
-                continue
-            n_total += 1
-            n_correct += int(bool(ic))
-        if n_total > 0:
-            summary[k] = dict(
-                accuracy=100.0 * n_correct / n_total,
-                n_correct=n_correct, n_total=n_total,
+    for rule in SELECTION_RULES:
+        key = f"cimr_{rule}"
+        flags = [
+            qr[key]["is_correct"] for qr in question_results
+            if key in qr and qr[key].get("is_correct") is not None
+        ]
+        if flags:
+            n_correct = sum(int(bool(f)) for f in flags)
+            summary[key] = dict(
+                accuracy=100.0 * n_correct / len(flags),
+                n_correct=n_correct,
+                n_total=len(flags),
             )
-    cimr_rescued = 0; cimr_hurt = 0
-    multiplicity_fired = 0
-    dnbon_rescued = 0; dnbon_hurt = 0
-    for qr in all_qr:
-        meta = qr.get("__meta__", {}) or {}
-        if meta.get("multiplicity_bias_fired"):
-            multiplicity_fired += 1
-        if meta.get("dnbon_rescued"):
-            dnbon_rescued += 1
-        if meta.get("dnbon_hurt"):
-            dnbon_hurt += 1
-        bon_correct = (qr.get("bon", {}) or {}).get("is_correct")
-        cimr_maj = (qr.get("cimr_majority", {}) or {}).get("is_correct")
-        if bon_correct is not None and cimr_maj is not None:
-            if (not bon_correct) and cimr_maj:
-                cimr_rescued += 1
-            if bon_correct and (not cimr_maj):
-                cimr_hurt += 1
-    n_q = max(len(all_qr), 1)
-    summary["__redundancy__"] = dict(
-        multiplicity_bias_fired_count=multiplicity_fired,
-        multiplicity_bias_fired_pct=100.0 * multiplicity_fired / n_q,
-        dnbon_rescued_count=dnbon_rescued, dnbon_hurt_count=dnbon_hurt,
-        dnbon_net_help=dnbon_rescued - dnbon_hurt,
-        cimr_rescued_count=cimr_rescued, cimr_hurt_count=cimr_hurt,
-        cimr_net_help=cimr_rescued - cimr_hurt,
-    )
+    return summary
+
+
+def _write_outputs(summary_path: str, results_path: str,
+                   question_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Atomically write the summary JSON and the per-question JSONL."""
+    summary = summarize(question_results)
+    tmp = summary_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    os.replace(tmp, summary_path)
+
+    tmp = results_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for qr in question_results:
+            f.write(json.dumps(qr, ensure_ascii=False, default=str) + "\n")
+    os.replace(tmp, results_path)
     return summary
 
 
@@ -448,9 +151,7 @@ def aggregate_results(all_qr: List[Dict[str, Any]]) -> Dict[str, Any]:
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(args.output_dir, "figures"), exist_ok=True)
 
-    # Build tag — encodes dataset, N, d, and active ablations
     tag_suffix = ""
     if args.no_critique:
         tag_suffix += "_no_critique"
@@ -458,101 +159,53 @@ def main():
         tag_suffix += "_no_correction"
     tag = f"{args.dataset}_N{args.cimr_n_rollouts}_d{args.cimr_depth}{tag_suffix}"
 
-    from src.cimr_inference import (  # type: ignore
-        SELECTION_RULE_NAMES, CIMRConfig, CIMRInferencer,
-        run_cimr_for_question, save_cimr_store,
-    )
-    from src.cimr_step import CIMRStepConfig  # type: ignore
-
-    # ── GPU setup ──────────────────────────────────────────────────────────
     if args.gpus is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
         logger.info(f"CUDA_VISIBLE_DEVICES={args.gpus}")
-    import torch  # noqa: E402
-    if torch.cuda.is_available():
-        logger.info(f"GPUs available: {torch.cuda.device_count()}")
 
-    # ── Load dataset ───────────────────────────────────────────────────────
+    from src.cimr_inference import CIMRConfig, CIMRInferencer
+    from src.cimr_step import CIMRStepConfig
+    from src.dataset_loader import load_dataset_split
+    from src.inference_methods import _build_evaluator
+    from src.model_wrapper import HFModelWrapper
+    from src.verifier import build_verifier
+
     logger.info(f"Loading dataset: {args.dataset}")
-    from src.dataset_loader import load_dataset_split  # type: ignore
     examples = load_dataset_split(
         data_name=args.dataset, split=args.split,
         max_samples=args.max_samples, custom_path=args.custom_path,
         cache_dir=args.hf_cache_dir,
     )
     data_name = examples[0]["_data_name"] if examples else args.dataset
-    logger.info(f"Loaded {len(examples)} examples.")
 
-    # ── Load model ─────────────────────────────────────────────────────────
     logger.info(f"Loading generator: {args.model}")
-    from src.model_wrapper import HFModelWrapper  # type: ignore
     model = HFModelWrapper(
         model_name_or_path=args.model,
         batch_size=args.batch_size,
         device=args.device, dtype=args.dtype,
         load_in_4bit=args.load_in_4bit, load_in_8bit=args.load_in_8bit,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature, top_p=args.top_p,
         trust_remote_code=args.trust_remote_code,
         cache_dir=args.hf_cache_dir,
     )
 
-    # ── Load verifier ──────────────────────────────────────────────────────
-    logger.info(f"Loading verifier: {args.verifier_model}")
-    from src.verifier import build_verifier  # type: ignore
-    verifier = build_verifier(
-        verifier_type="prm", data_name=data_name,
-        prm_model=args.verifier_model,
-        prm_aggregation=args.prm_aggregation,
-        device=args.device, cache_dir=args.hf_cache_dir,
-        batch_size=args.batch_size,
-    )
+    verifier = None
+    if not args.no_prm:
+        logger.info(f"Loading diagnostic PRM: {args.verifier_model}")
+        verifier = build_verifier(
+            verifier_type="prm", data_name=data_name,
+            prm_model=args.verifier_model,
+            prm_aggregation=args.prm_aggregation,
+            device=args.device, cache_dir=args.hf_cache_dir,
+            batch_size=args.batch_size,
+        )
 
-    # ── Build evaluator ────────────────────────────────────────────────────
-    from src.inference_methods import _build_evaluator  # type: ignore
     ev = _build_evaluator(data_name)
-    try:
-        from src.inference_methods import _check_correct  # type: ignore
-    except Exception:
-        _check_correct = None
 
-    # ── ClusterManager ─────────────────────────────────────────────────────
-    logger.info(f"Loading ClusterManager: {args.embedding_model}")
-    from src.clustering import ClusterManager  # type: ignore
-    cluster_manager = ClusterManager(
-        embedding_model=args.embedding_model,
-        similarity_threshold=args.tau_values[0],
-        clustering_method=args.clustering_method,
-        use_answer_only=False, batch_size=args.batch_size,
-    )
-
-    # ── Build minimal per-question records ─────────────────────────────────
-    records = []
-    for i, ex in enumerate(examples):
-        records.append({
-            "id": ex.get("id", str(i)),
-            "question": ex.get("question"),
-            "gold_answer": ex.get("answer", None),
-        })
-
-    all_question_results: List[Dict[str, Any]] = []
-    for i, rec in enumerate(records):
-        all_question_results.append({
-            "__id__": rec.get("id", str(i)),
-            "__meta__": {"question": rec.get("question")},
-        })
-
-    summary_path = os.path.join(args.output_dir, f"summary_paired_{tag}.json")
-    results_path = os.path.join(args.output_dir, f"results_paired_{tag}.jsonl")
-
-    # ── CIMR pass (live, on-the-go save + resume) ──────────────────────────
-    N_roll = int(args.cimr_n_rollouts)
-    D      = int(args.cimr_depth)
+    N, D = int(args.cimr_n_rollouts), int(args.cimr_depth)
     logger.info(
-        f"CIMR  N_rollouts={N_roll}  depth={D}  "
-        f"no_critique={args.no_critique}  no_correction={args.no_correction}"
+        f"Refinement  N={N}  D={D}  no_critique={args.no_critique}  "
+        f"no_correction={args.no_correction}  prm={'off' if verifier is None else 'on'}"
     )
-
     step_cfg = CIMRStepConfig(
         reasoning_max_new_tokens=args.cimr_reasoning_max_new_tokens,
         reasoning_temperature=args.cimr_reasoning_temperature,
@@ -564,191 +217,85 @@ def main():
         correction_max_trace_chars=args.cimr_correction_max_trace_chars,
         correction_max_critique_chars=args.cimr_correction_max_critique_chars,
         continuation_max_prior_chars=args.cimr_continuation_max_prior_chars,
-        other_answer_aware=args.cimr_other_answer_aware,
         no_critique=args.no_critique,
         no_correction=args.no_correction,
     )
-    cimr_cfg = CIMRConfig(
-        n_rollouts=N_roll, depth=D, step_config=step_cfg,
-        rollout_temperature=args.cimr_reasoning_temperature,
-        rollout_top_p=args.cimr_reasoning_top_p,
-        tag_suffix=tag_suffix,
-    )
     inferencer = CIMRInferencer(
-        model=model, verifier=verifier, ev=ev,
-        data_name=data_name, config=cimr_cfg,
+        model=model, verifier=verifier, ev=ev, data_name=data_name,
+        config=CIMRConfig(n_rollouts=N, depth=D, step_config=step_cfg,
+                          tag_suffix=tag_suffix),
         output_dir=args.output_dir, dataset=args.dataset,
     )
 
-    n_resumed = 0; n_run_now = 0
-    for i, rec in enumerate(records):
-        qid = str(rec.get("id", i))
-        was_complete = bool(
-            (inferencer.store.get(qid) or {}).get("completed", False)
-        )
+    summary_path = os.path.join(args.output_dir, f"summary_paired_{tag}.json")
+    results_path = os.path.join(args.output_dir, f"results_paired_{tag}.jsonl")
 
-        qrec = run_cimr_for_question(
-            inferencer=inferencer,
-            question=rec["question"],
-            gold_answer=rec.get("gold_answer"),
-            qid=qid,
-        )
-
-        if was_complete:
+    question_results: List[Dict[str, Any]] = []
+    n_resumed = n_fresh = 0
+    for i, ex in enumerate(examples):
+        qid = str(ex.get("id", i))
+        if (inferencer.store.get(qid) or {}).get("completed", False):
             n_resumed += 1
         else:
-            n_run_now += 1
+            n_fresh += 1
 
-        agg = qrec.get("aggregation", {}) or {}
-        maj_pred = agg.get("majority_pred", "")
-        prm_pred = agg.get("max_prm_pred", "")
-        maj_is_correct = agg.get("majority_is_correct")
-        prm_is_correct = agg.get("max_prm_is_correct")
-
-        if rec.get("gold_answer") is not None and _check_correct is not None:
-            if maj_is_correct is None and maj_pred:
-                try:
-                    maj_is_correct = bool(
-                        _check_correct(maj_pred, rec.get("gold_answer"), ev, data_name)
-                    )
-                except Exception:
-                    pass
-            if prm_is_correct is None and prm_pred:
-                try:
-                    prm_is_correct = bool(
-                        _check_correct(prm_pred, rec.get("gold_answer"), ev, data_name)
-                    )
-                except Exception:
-                    pass
-
-        agg["majority_is_correct"] = maj_is_correct
-        agg["max_prm_is_correct"] = prm_is_correct
-        qrec["aggregation"] = agg
-        try:
-            inferencer.store[qid] = qrec
-            save_cimr_store(inferencer.store_path, inferencer.store)
-        except Exception:
-            pass
-
-        all_question_results[i]["cimr_majority"] = dict(
-            method="cimr_majority", selection_rule="majority",
-            predicted_answer=maj_pred, is_correct=maj_is_correct,
-            rollout_idx=agg.get("majority_rollout_idx", -1),
-            vote_count=agg.get("majority_vote_count", 0),
-            n_rollouts=agg.get("n_rollouts", N_roll), depth=D,
+        qrec = inferencer.run_question(
+            question=ex["question"], gold_answer=ex.get("answer"), qid=qid,
         )
-        all_question_results[i]["cimr_max_prm"] = dict(
-            method="cimr_max_prm", selection_rule="max_prm",
-            predicted_answer=prm_pred, is_correct=prm_is_correct,
-            rollout_idx=agg.get("max_prm_rollout_idx", -1),
-            prm_score=agg.get("max_prm_score", 0.0),
-            n_rollouts=agg.get("n_rollouts", N_roll), depth=D,
-        )
+        agg = qrec.get("aggregation") or {}
+        question_results.append({
+            "__id__": qid,
+            "cimr_majority": dict(
+                method="cimr_majority", selection_rule="majority",
+                predicted_answer=agg.get("majority_pred", ""),
+                is_correct=agg.get("majority_is_correct"),
+                rollout_idx=agg.get("majority_rollout_idx", -1),
+                vote_count=agg.get("majority_vote_count", 0),
+                n_rollouts=agg.get("n_rollouts", N), depth=D,
+            ),
+            "cimr_max_prm": dict(
+                method="cimr_max_prm", selection_rule="max_prm",
+                predicted_answer=agg.get("max_prm_pred", ""),
+                is_correct=agg.get("max_prm_is_correct"),
+                rollout_idx=agg.get("max_prm_rollout_idx", -1),
+                prm_score=agg.get("max_prm_score", 0.0),
+                n_rollouts=agg.get("n_rollouts", N), depth=D,
+            ),
+        })
 
-        if (n_run_now + n_resumed) % max(args.log_every, 1) == 0 \
-           or (i + 1) == len(records):
-            logger.info(
-                f"  CIMR  q={i+1}/{len(records)}  "
-                f"fresh={n_run_now}  resumed={n_resumed}  id={qid}  "
-                f"maj={agg.get('majority_pred', '')!r}({agg.get('majority_is_correct')})  "
-                f"prm={agg.get('max_prm_pred', '')!r}({agg.get('max_prm_is_correct')})"
-            )
+        if (i + 1) % max(args.log_every, 1) == 0 or (i + 1) == len(examples):
             try:
-                cur_summary = aggregate_results(all_question_results)
-                tmp = summary_path + ".tmp"
-                with open(tmp, "w") as sf:
-                    json.dump(cur_summary, sf, indent=2)
-                os.replace(tmp, summary_path)
-                tmp2 = results_path + ".tmp"
-                with open(tmp2, "w", encoding="utf-8") as rf:
-                    for qr in all_question_results:
-                        rf.write(json.dumps(qr, ensure_ascii=False, default=str) + "\n")
-                os.replace(tmp2, results_path)
+                summary = _write_outputs(summary_path, results_path, question_results)
             except Exception as e:
-                logger.warning(f"Failed to write incremental summary: {e}")
-
-            try:
-                for m, v in sorted(cur_summary.items()):
-                    if m.startswith("__"):
-                        continue
-                    logger.info(
-                        f"    {m:<20s} acc={v['accuracy']:6.2f}%  "
-                        f"({v['n_correct']}/{v['n_total']})"
-                    )
-            except Exception:
-                pass
-
-    logger.info(
-        f"  CIMR complete.  total={len(records)}  "
-        f"fresh={n_run_now}  resumed={n_resumed}  store={inferencer.store_path}"
-    )
-
-    # ── Aggregate + save ───────────────────────────────────────────────────
-    summary = aggregate_results(all_question_results)
-
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    logger.info(f"Summary → {summary_path}")
-
-    with open(os.path.join(args.output_dir, f"analysis_paired_{tag}.json"), "w") as f:
-        json.dump(
-            [{"id": qr.get("__id__"), **qr.get("__meta__", {})} for qr in all_question_results],
-            f, indent=2,
-        )
-
-    with open(results_path, "w", encoding="utf-8") as f:
-        for qr in all_question_results:
-            f.write(json.dumps(qr, ensure_ascii=False, default=str) + "\n")
-    logger.info(f"Per-question results → {results_path}")
-
-    # ── Console summary ────────────────────────────────────────────────────
-    logger.info("\n" + "=" * 72)
-    logger.info(
-        f" CIMR SUMMARY  |  {args.dataset}  |  "
-        f"N_rollouts={N_roll}  depth={D}  suffix={tag_suffix or 'none'}"
-    )
-    logger.info("=" * 72)
-
-    logger.info("  " + "·" * 60)
-    for rule in ["majority", "max_prm"]:
-        key = f"cimr_{rule}"
-        if key in summary:
-            s = summary[key]
+                logger.warning(f"Failed to write incremental outputs: {e}")
+                summary = summarize(question_results)
             logger.info(
-                f"  CIMR  {rule:<10s}  acc={s['accuracy']:6.2f}%  "
-                f"({s['n_correct']}/{s['n_total']})"
+                f"  q={i + 1}/{len(examples)}  fresh={n_fresh}  resumed={n_resumed}  "
+                f"id={qid}  maj={agg.get('majority_pred', '')!r}"
+                f"({agg.get('majority_is_correct')})"
             )
-
-    logger.info("  " + "─" * 60)
-    bon_acc = summary.get("bon", {}).get("accuracy", 0.0)
-    best_dn, best_acc_val = None, -1.0
-    for a in args.alpha_values:
-        for t in args.tau_values:
-            k = f"dn_bon_tau{t:.2f}_alpha{a:.2f}"
-            if k in summary:
-                s = summary[k]
-                delta = s["accuracy"] - bon_acc
-                marker = " ◀ BEST" if s["accuracy"] > best_acc_val else ""
-                if s["accuracy"] > best_acc_val:
-                    best_acc_val = s["accuracy"]
-                    best_dn = k
+            for m, v in sorted(summary.items()):
                 logger.info(
-                    f"  DN-BoN α={a:.2f} τ={t:.2f}   "
-                    f"acc={s['accuracy']:6.2f}%  Δ={delta:+.2f}pp{marker}"
+                    f"    {m:<16s} acc={v['accuracy']:6.2f}%  "
+                    f"({v['n_correct']}/{v['n_total']})"
                 )
 
-    if "__redundancy__" in summary:
-        r = summary["__redundancy__"]
-        logger.info("  " + "─" * 60)
-        logger.info(
-            f"  CIMR rescued: {r['cimr_rescued_count']}  "
-            f"hurt: {r['cimr_hurt_count']}  net: {r['cimr_net_help']:+d}"
-        )
+    summary = _write_outputs(summary_path, results_path, question_results)
+
     logger.info("=" * 72)
-    if best_dn:
-        logger.info(f"  Best DN-BoN: {best_dn}  ({best_acc_val:.2f}%)")
-    logger.info("=" * 72 + "\n")
-    logger.info("Done.  Outputs in: " + args.output_dir)
+    logger.info(
+        f" SUMMARY  {args.dataset}  N={N}  D={D}  ablation={tag_suffix or 'none'}"
+    )
+    for rule in SELECTION_RULES:
+        s = summary.get(f"cimr_{rule}")
+        if s:
+            logger.info(
+                f"  {rule:<10s} acc={s['accuracy']:6.2f}%  ({s['n_correct']}/{s['n_total']})"
+            )
+    logger.info(f"  store:   {inferencer.store_path}")
+    logger.info(f"  summary: {summary_path}")
+    logger.info(f"  results: {results_path}")
+    logger.info("=" * 72)
 
 
 if __name__ == "__main__":

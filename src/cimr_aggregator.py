@@ -1,27 +1,19 @@
-"""
-cimr_aggregator.py
-==================
-Aggregate the N completed rollouts for a single question into two final
-predictions:
+"""Answer aggregation over the N refined rollouts (Algorithm 1, lines 10-13).
 
-  1. Majority vote — modal answer across the N final corrected answers.
-     Ties broken by: larger total PRM score in the tied group → lower
-     rollout index.
+Given the terminal answers ``a_i = Extract(r_i^(D))``, two predictions are
+returned side by side:
 
-  2. Max-PRM (Best-of-N) — answer of the rollout with the highest
-     final corrected-trace PRM score.
+1. ``majority`` -- the method's prediction: plurality vote
+   ``a = Vote({a_i})`` over normalised answers. Empty answers do not vote.
+   Ties on vote count are broken by the larger summed PRM score of the tied
+   group, then by the lower first rollout index. Without a verifier
+   (``--no_prm``) every PRM score is 0 and ties fall back to rollout order.
+2. ``max_prm`` -- a diagnostic: the answer of the rollout whose terminal trace
+   has the highest PRM score. It is not part of the method.
 
-Both predictions + correctness flags are returned so callers can compare
-them side-by-side.
-
-Normalisation
--------------
-``_normalize_answer_key`` does light canonicalisation for grouping:
-  - strip whitespace and LaTeX spacing commands
-  - unwrap single-level surrounding braces
-  - strip trailing zeros from decimals
-Mathematical equality (e.g. 1/2 vs 0.5) is left to the evaluator's
-``_check_correct`` at scoring time.
+Grouping uses ``normalize_answer_key``, a light string canonicalisation.
+Mathematical equivalence (e.g. ``1/2`` vs ``0.5``) is only resolved later,
+when each prediction is compared against the gold answer.
 """
 
 from __future__ import annotations
@@ -34,29 +26,25 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Canonicalisation
-# =============================================================================
+def normalize_answer_key(ans: str) -> str:
+    """Canonical voting key for an extracted answer.
 
-def _normalize_answer_key(ans: str) -> str:
+    Removes spaces and LaTeX spacing commands (``\\,``, ``\\!``, ``\\;``),
+    unwraps one enclosing pair of braces and strips trailing decimal zeros
+    (``3.500`` -> ``3.5``). Case is preserved.
+    """
     s = str(ans or "").strip()
     if not s:
         return ""
     s = s.replace(" ", "")
-    # Drop LaTeX thin/negative spaces.
     s = s.replace("\\,", "").replace("\\!", "").replace("\\;", "")
-    # Unwrap a single wrapping pair of braces.
     if s.startswith("{") and s.endswith("}") and s.count("{") == 1:
         s = s[1:-1]
-    # Strip trailing zeros from decimals like "3.500" → "3.5".
     if re.fullmatch(r"-?\d+\.\d+", s):
         s = s.rstrip("0").rstrip(".")
     return s
 
 
-# =============================================================================
-# Aggregation
-# =============================================================================
 
 def aggregate_rollouts(
     rollouts: List[Dict[str, Any]],
@@ -64,23 +52,21 @@ def aggregate_rollouts(
     ev=None,
     data_name: str = "math",
 ) -> Dict[str, Any]:
-    """Aggregate N rollout records into majority-vote and max-PRM predictions.
+    """Aggregate rollout records into the majority-vote and max-PRM predictions.
 
     Parameters
     ----------
-    rollouts    : list of rollout dicts from ``_build_rollout_record``.
-    gold_answer : ground-truth answer string (optional).
-    ev          : evaluator object with ``_check_correct`` accessible via
-                  ``inference_methods._check_correct``.
-    data_name   : dataset name passed to ``_check_correct``.
+    rollouts    : rollout records from ``cimr_rollout._build_rollout_record``.
+    gold_answer : gold answer; correctness fields are ``None`` without it.
+    ev          : dataset evaluator used for the correctness check.
+    data_name   : dataset name forwarded to the correctness check.
 
     Returns
     -------
-    dict with keys:
-      majority_pred, majority_is_correct, majority_rollout_idx,
-      majority_vote_count,
-      max_prm_pred, max_prm_is_correct, max_prm_rollout_idx, max_prm_score,
-      per_rollout_summary, n_rollouts
+    dict with ``majority_pred``, ``majority_is_correct``,
+    ``majority_rollout_idx``, ``majority_vote_count``, ``max_prm_pred``,
+    ``max_prm_is_correct``, ``max_prm_rollout_idx``, ``max_prm_score``,
+    ``per_rollout_summary`` and ``n_rollouts``.
     """
     if not rollouts:
         return dict(
@@ -91,21 +77,21 @@ def aggregate_rollouts(
             per_rollout_summary=[], n_rollouts=0,
         )
 
-    # ── Per-rollout summary ─────────────────────────────────────────────
-    per_rollout: List[Dict[str, Any]] = []
-    for r in rollouts:
-        per_rollout.append(dict(
+    per_rollout: List[Dict[str, Any]] = [
+        dict(
             rollout_idx=int(r.get("rollout_idx", -1)),
             final_answer=str(r.get("final_answer", "")),
             final_prm_score=float(r.get("final_prm_score", 0.0)),
-        ))
+        )
+        for r in rollouts
+    ]
 
-    # ── 1) Majority vote ────────────────────────────────────────────────
+    # ── Plurality vote ──────────────────────────────────────────────────────
     bucket: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
     for r in per_rollout:
-        key = _normalize_answer_key(r["final_answer"])
+        key = normalize_answer_key(r["final_answer"])
         if not key:
-            continue  # Skip empty answers — they don't vote.
+            continue
         if key not in bucket:
             bucket[key] = dict(
                 key=key,
@@ -120,13 +106,12 @@ def aggregate_rollouts(
         bucket[key]["rollout_idxs"].append(int(r["rollout_idx"]))
 
     if bucket:
-        # Sort by (count DESC, sum_prm DESC, first_idx ASC).
-        ranked = sorted(
+        # Rank by (votes desc, summed PRM desc, first rollout index asc).
+        winner = sorted(
             bucket.values(),
             key=lambda b: (b["count"], b["sum_prm"], -b["first_idx"]),
             reverse=True,
-        )
-        winner = ranked[0]
+        )[0]
         majority_pred = winner["display"]
         majority_rollout_idx = int(winner["first_idx"])
         majority_vote_count = int(winner["count"])
@@ -135,21 +120,17 @@ def aggregate_rollouts(
         majority_rollout_idx = -1
         majority_vote_count = 0
 
-    # ── 2) Max-PRM (Best-of-N over corrected traces) ────────────────────
+    # ── Max-PRM selection (diagnostic) ──────────────────────────────────────
     best = max(per_rollout, key=lambda r: r["final_prm_score"])
     max_prm_pred = best["final_answer"]
     max_prm_rollout_idx = int(best["rollout_idx"])
     max_prm_score = float(best["final_prm_score"])
 
-    # ── Correctness checks ──────────────────────────────────────────────
     def _is_correct(pred: str) -> Optional[bool]:
         if gold_answer is None or ev is None or not pred:
             return None
         try:
-            try:
-                from src.inference_methods import _check_correct  # type: ignore
-            except Exception:
-                from inference_methods import _check_correct  # type: ignore
+            from .inference_methods import _check_correct
             return bool(_check_correct(pred, gold_answer, ev, data_name))
         except Exception as e:
             logger.debug(f"[CIMR aggregator] correctness check failed: {e}")
@@ -180,4 +161,4 @@ def aggregate_rollouts(
     )
 
 
-__all__ = ["aggregate_rollouts", "_normalize_answer_key"]
+__all__ = ["aggregate_rollouts", "normalize_answer_key"]

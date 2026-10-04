@@ -1,12 +1,27 @@
-*.pyc
+# Python
 __pycache__/
+*.pyc
+.venv/
+
+# Experiment outputs and logs
+experiments_results/
+results_paired/
+results_baselines/
 **/logs/
 **/log/
 *.log
+slurm-*.out
+*.tmp
+
+# Generated data and figures
 *.json
 *.jsonl
-*.txt
+*.csv
 *.png
 *.pdf
-*.csv
+*.txt
+!requirements.txt
 
+# Paper sources and local environment spec (not tracked)
+*.tex
+pyproject.toml

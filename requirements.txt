@@ -1,26 +1,26 @@
-# Core
+# Minimal pip requirements. For the exact pinned environment use `uv sync`
+# (pyproject.toml + uv.lock).
+
+# Models and data
 torch>=2.0.0
 transformers>=4.40.0
+accelerate>=0.28.0          # device_map="auto"
 datasets>=2.18.0
-accelerate>=0.28.0
-huggingface_hub>=0.22.0
 
-# Math answer parsing (required by grader.py / parser.py)
+# Answer checking (src/evaluator_classes.py, src/math_toolkit/)
 sympy>=1.12
+pyparsing>=3.0
 latex2sympy2>=1.9.1
-regex>=2023.12.25
-word2number>=1.1
 
-# Clustering / embeddings
+# Sampling-redundancy clustering (src/clustering.py)
 sentence-transformers>=2.7.0
 scikit-learn>=1.4.0
 
-# Optional: quantisation
-# bitsandbytes>=0.43.0   # uncomment for 4-bit / 8-bit quantisation
+# TFLOP accounting (extract_compute_flop.py, extract_baseline_flop.py)
+tiktoken>=0.7.0
 
-# Optional: PRM verifier
-# (uses transformers – already listed above)
-
-# Utilities
 numpy>=1.26.0
 tqdm>=4.66.0
+
+# Optional: 4-bit / 8-bit loading (--load_in_4bit / --load_in_8bit)
+# bitsandbytes>=0.43.0

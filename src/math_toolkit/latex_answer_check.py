@@ -15,10 +15,7 @@ from sympy.parsing.latex import parse_latex
 from sympy.parsing.sympy_parser import parse_expr
 from itertools import permutations
 
-from help_functions.math_toolkit.parsing_lib import *
-# from .custom_toolkit.latex import transform_tex
-# from evaluation.utils.custom_toolkit.latex import check_tex_equiv
-# from evaluation.utils.custom_toolkit.funcs import check_funcs_equiv
+from .parsing_lib import *
 
 
 def has_numbers(input_string: str) -> bool:
@@ -42,7 +39,7 @@ def sympy_parse(input_string: str) -> Any:
     Parsing strings into mathematical expressions using sympy
     """
     for f in [parse_latex, parse_expr]:
-        #!!!!!!! IMPORTANT: This is a temperary fix for sympy parsing issue
+        # parse_expr expects Python's ** for exponentiation.
         if f == parse_expr:
             if "^" in input_string:
                 input_string = input_string.replace("^", "**")
@@ -181,22 +178,6 @@ def sqrt_to_float(sqrt_str):
         return radicand ** (1 / degree)
     
     raise ValueError("Input is not a valid \sqrt[]{} string")
-
-
-#TODO: this one does not work when running RL, don't know why
-# def convert_latex_numerical_string_to_float(latex_str):
-#     """
-#     Evaluate a LaTeX string to its numerical value.
-#     Handles nested fractions and square roots.
-#     """
-#     try:
-#         res = transform_tex(latex_str, "sympy")
-#         res = float(res)
-#         return res
-#     except:
-#         pass
-    
-#     return None
 
 
 def convert_latex_numerical_string_to_float(latex_str):
@@ -385,7 +366,7 @@ def _latex_equiv(model_answer: str, gt_answer: str) -> bool:
         if any(number_check(x, y) for x in [model_answer_no_percent, model_answer] for y in [gt_answer_no_percent, gt_answer]):
             return True
     
-    # We wan't to use raw model_answer to keep the $$
+    # Use the raw model_answer to keep the $$
     # $13$ meters --> $13$ --> 13
     model_ans_num_lst = search_for_numbers(model_answer)
 
@@ -403,14 +384,13 @@ def _latex_equiv(model_answer: str, gt_answer: str) -> bool:
     # Here we must be really really careful.
     # x \\leq -5 vs. x \\geq -5
     # (-\\infty, 5) vs. (5, +\\infty)
-    # TODO: We may have better methods to check if the numbers are simple enough
     if len(model_ans_num_lst) == 1 and len(gt_num_lst) == 1 and \
         not has_structure(model_answer.replace(model_ans_num_lst[0], "")) and \
         not has_structure(gt_answer.replace(gt_num_lst[0], "")):
 
         model_num = remove_prefix_and_suffix(remove_boxes_keep_content(remove_text_box_only(model_ans_num_lst[0])))
         gt_num = remove_prefix_and_suffix(remove_boxes_keep_content(remove_text_box_only(gt_num_lst[0])))
-        parse_result = number_check(model_num, gt_num)  #todo: check if this is correct
+        parse_result = number_check(model_num, gt_num)
 
         # As an additional method of judgment, even if it returns False we can't say that the answer is wrong, it could be caused by an unreasonable extraction of numbers
         if parse_result is True:

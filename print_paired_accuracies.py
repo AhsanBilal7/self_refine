@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
-Print accuracies from paired-result outputs.
+Print a table of breadth-depth refinement accuracies across runs.
 
-Primary source:
-    <results_dir>/<model_run_folder>/summary_paired_<dataset>_N<N>.json
+Reads ``summary_paired_<dataset>_N<N>_d<D>[_no_critique][_no_correction].json``
+files under ``--results_dir`` (written by ``run_paired_ablation.py``). If none
+are found, accuracies are recomputed from the ``cimr_full_results_*.json``
+stores instead. ``cimr_majority`` is the method's prediction; ``cimr_max_prm``
+is the diagnostic max-PRM selection.
 
-Fallback source (when summary files are missing):
-    <results_dir>/<model_run_folder>/cimr_full_results_<dataset>_N<N>_d<D>.json
+Usage
+-----
+    python print_paired_accuracies.py \
+        [--results_dir experiments_results/results_paired] \
+        [--dataset amc23] [--method cimr_majority] [--out_csv accuracies.csv]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import math
 
-_SUMMARY_RE = re.compile(r"^summary_paired_(?P<dataset>.+)_N(?P<N>\d+)\.json$")
-_CIMR_FULL_RE = re.compile(
-    r"^cimr_full_results_(?P<dataset>.+)_N(?P<N>\d+)_d(?P<D>\d+)\.json$"
-)
+_TAG = r"(?P<dataset>.+?)_N(?P<N>\d+)_d(?P<D>\d+)(?P<suffix>(?:_no_critique|_no_correction)*)"
+_SUMMARY_RE = re.compile(rf"^summary_paired_{_TAG}\.json$")
+_CIMR_FULL_RE = re.compile(rf"^cimr_full_results_{_TAG}\.json$")
 
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
@@ -53,6 +58,8 @@ def collect_rows(
 
         dataset = m.group("dataset")
         n_value = _safe_int(m.group("N"), 0)
+        d_value = _safe_int(m.group("D"), 0)
+        ablation = m.group("suffix").lstrip("_") or "none"
 
         if dataset_filter and dataset != dataset_filter:
             continue
@@ -98,6 +105,8 @@ def collect_rows(
                     "model_run": model_run,
                     "dataset": dataset,
                     "N": n_value,
+                    "D": d_value,
+                    "ablation": ablation,
                     "method": method,
                     "accuracy": accuracy,
                     "n_correct": n_correct,
@@ -106,7 +115,7 @@ def collect_rows(
                 }
             )
 
-    rows.sort(key=lambda r: (r["model_run"], r["dataset"], r["N"], r["method"]))
+    rows.sort(key=lambda r: (r["model_run"], r["dataset"], r["N"], r["D"], r["ablation"], r["method"]))
     return rows
 
 
@@ -115,16 +124,18 @@ def _collect_rows_from_cimr_full(
     dataset_filter: Optional[str] = None,
     method_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Fallback: derive CIMR accuracies directly from cimr_full_results files."""
+    """Fallback: recompute accuracies from the cimr_full_results stores."""
     rows: List[Dict[str, Any]] = []
 
-    for path in sorted(results_dir.rglob("cimr_full_results_*_N*_d*.json")):
+    for path in sorted(results_dir.rglob("cimr_full_results_*.json")):
         m = _CIMR_FULL_RE.match(path.name)
         if not m:
             continue
 
         dataset = m.group("dataset")
         n_value = _safe_int(m.group("N"), 0)
+        d_value = _safe_int(m.group("D"), 0)
+        ablation = m.group("suffix").lstrip("_") or "none"
         if dataset_filter and dataset != dataset_filter:
             continue
 
@@ -170,6 +181,8 @@ def _collect_rows_from_cimr_full(
                 "model_run": model_run,
                 "dataset": dataset,
                 "N": n_value,
+                "D": d_value,
+                "ablation": ablation,
                 "method": "cimr_majority",
                 "accuracy": maj_acc,
                 "n_correct": maj_correct,
@@ -180,6 +193,8 @@ def _collect_rows_from_cimr_full(
                 "model_run": model_run,
                 "dataset": dataset,
                 "N": n_value,
+                "D": d_value,
+                "ablation": ablation,
                 "method": "cimr_max_prm",
                 "accuracy": prm_acc,
                 "n_correct": prm_correct,
@@ -193,7 +208,7 @@ def _collect_rows_from_cimr_full(
                 continue
             rows.append(r)
 
-    rows.sort(key=lambda r: (r["model_run"], r["dataset"], r["N"], r["method"]))
+    rows.sort(key=lambda r: (r["model_run"], r["dataset"], r["N"], r["D"], r["ablation"], r["method"]))
     return rows
 
 
@@ -202,7 +217,7 @@ def print_table(rows: List[Dict[str, Any]]) -> None:
         print("No paired summary accuracies found.")
         return
 
-    headers = ["model_run", "dataset", "N", "method", "accuracy", "correct/total"]
+    headers = ["model_run", "dataset", "N", "D", "ablation", "method", "accuracy", "correct/total"]
 
     formatted: List[List[str]] = []
     for r in rows:
@@ -211,6 +226,8 @@ def print_table(rows: List[Dict[str, Any]]) -> None:
                 str(r["model_run"]),
                 str(r["dataset"]),
                 str(r["N"]),
+                str(r["D"]),
+                str(r["ablation"]),
                 str(r["method"]),
                 (f"{r['accuracy']:.2f}%" if not math.isnan(float(r["accuracy"])) else "N/A"),
                 f"{r['n_correct']}/{r['n_total']}",
@@ -244,6 +261,8 @@ def write_csv(rows: List[Dict[str, Any]], out_csv: Path) -> None:
                 "model_run",
                 "dataset",
                 "N",
+                "D",
+                "ablation",
                 "method",
                 "accuracy",
                 "n_correct",
@@ -259,7 +278,7 @@ def write_csv(rows: List[Dict[str, Any]], out_csv: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Print accuracies from paired-result summary files."
+        description="Print breadth-depth refinement accuracies across runs."
     )
     p.add_argument(
         "--results_dir",
@@ -297,7 +316,7 @@ def main() -> None:
         sys.exit(1)
 
     summary_files = sorted(results_dir.rglob("summary_paired_*.json"))
-    cimr_full_files = sorted(results_dir.rglob("cimr_full_results_*_N*_d*.json"))
+    cimr_full_files = sorted(results_dir.rglob("cimr_full_results_*.json"))
     if args.debug:
         print(f"Scanning results_dir: {results_dir.resolve()}")
         print(f"  summary_paired files found: {len(summary_files)}")
@@ -310,7 +329,7 @@ def main() -> None:
     )
 
     if not rows:
-        # Fallback to CIMR full logs when summary_paired files are missing.
+        # No summary files: fall back to the full result stores.
         rows = _collect_rows_from_cimr_full(
             results_dir=results_dir,
             dataset_filter=args.dataset,

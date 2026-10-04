@@ -1,45 +1,20 @@
-"""
-cimr_rollout.py
-===============
-N-rollout × d-step CIMR execution with batched generation per depth level.
+"""N rollouts x D refinement depths for one problem (Algorithm 1, lines 1-9).
 
-Architecture
-------------
-The outer loop iterates over depth steps (1 → d) sequentially because each
-step requires the corrected output of the prior step as input.
+Depths are processed sequentially because depth ``d`` needs ``r_i^(d-1)``.
+Within a depth, every rollout that still needs that depth is sent through
+``run_step_batch`` together, so each stage (continuation, critique,
+correction) is one batched generation call across the ``N`` rollouts::
 
-Within each depth level ALL N rollouts are processed simultaneously via a
-single batched model call, giving N× GPU utilisation vs. sequential rollouts.
+    d = 1:  sample r^(0) for all N rollouts -> critique -> correct -> r^(1)
+    d = 2:  continue from r^(1)             -> critique -> correct -> r^(2)
+    ...
+    d = D:  ...                                                    -> r^(D)
 
-    depth 1:  batch-generate reasoning for rollouts 0..N-1
-              batch-critique   all N traces
-              batch-correct    all N traces
-              PRM-score all corrected traces
-                         │
-                         ▼
-    depth 2:  batch-generate (given depth-1 corrected traces as context)
-              batch-critique
-              batch-correct
-              PRM-score
-                         │
-                      ...│...
-                         ▼
-    depth d:  → N final corrected traces + answers
-
-Resume support
---------------
-``run_all_rollouts_batched`` accepts ``resume_states`` (one dict per rollout).
-Rollouts that already have k completed steps re-enter at depth k+1 without
-re-running earlier steps.  At each depth only rollouts missing that step are
-included in the batch.
-
-The ``on_rollout_step_complete`` callback fires after every step for every
-rollout that was processed, allowing the caller to persist incrementally.
-
-Public symbols
---------------
-  run_all_rollouts_batched — main entry point
-  run_one_rollout          — single-rollout sequential entry point (compat)
+Resume. ``resume_states`` holds one previously saved rollout record (or
+``None``) per rollout. A rollout with ``k`` saved steps re-enters at depth
+``k + 1``; saved steps beyond the requested ``D`` are dropped.
+``on_rollout_step_complete`` fires after every (rollout, depth) step so the
+caller can persist progress.
 """
 
 from __future__ import annotations
@@ -48,14 +23,10 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from .cimr_step import CIMRStepConfig, run_one_step, run_step_batch
+from .cimr_step import CIMRStepConfig, run_step_batch
 
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# Internal helpers
-# =============================================================================
 
 def _error_step_record(
     rollout_idx: int,
@@ -64,6 +35,7 @@ def _error_step_record(
     prior: Optional[str],
     error: str = "",
 ) -> Dict[str, Any]:
+    """Placeholder step for a failed batch; carries ``r^(d-1)`` forward."""
     return dict(
         rollout_idx=int(rollout_idx),
         step_idx=int(step_idx),
@@ -89,7 +61,10 @@ def _build_rollout_record(
     completed: bool,
     elapsed_sec: float,
 ) -> Dict[str, Any]:
-    """Summarise a rollout from its list of completed step records."""
+    """Summarise a rollout from its step records.
+
+    ``final_answer`` is ``Extract(r_i^(D))``, the rollout's vote ``a_i``.
+    """
     if steps:
         last = steps[-1]
         final_answer = last.get("corrected_answer", "") or last.get("reasoning_answer", "")
@@ -113,16 +88,10 @@ def _build_rollout_record(
     )
 
 
-# =============================================================================
-# Batched N-rollout execution — main entry point
-# =============================================================================
-
 def run_all_rollouts_batched(
     *,
     model,
     verifier,
-    ev,
-    data_name: str,
     question: str,
     gold_answer: Optional[str],
     n_rollouts: int,
@@ -131,60 +100,44 @@ def run_all_rollouts_batched(
     on_rollout_step_complete: Optional[Callable[[int, Dict[str, Any]], None]] = None,
     resume_states: Optional[List[Optional[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Run N rollouts × D steps with batched GPU generation per depth level.
+    """Run ``n_rollouts`` rollouts for ``total_steps`` refinement depths.
 
     Parameters
     ----------
-    n_rollouts               : N independent rollouts per question.
-    total_steps              : d depth levels per rollout.
-    on_rollout_step_complete : callback(rollout_i, running_record) fired
-                               after every step for every processed rollout.
-                               Used by the orchestrator for incremental saves.
-    resume_states            : length-N list; each entry is None (fresh) or a
-                               previously-saved rollout dict with a "steps" key.
+    n_rollouts               : breadth ``N``.
+    total_steps              : depth ``D``.
+    on_rollout_step_complete : ``callback(rollout_idx, running_record)``.
+    resume_states            : length-``N`` list of saved rollout records or
+                               ``None`` entries.
 
     Returns
     -------
-    List of n_rollouts rollout-record dicts.
+    ``N`` rollout records (see ``_build_rollout_record``).
     """
     t0 = time.time()
 
-    # ── Initialise step lists from resume states ──────────────────────────
     all_steps: List[List[Dict[str, Any]]] = [[] for _ in range(n_rollouts)]
-
     if resume_states:
         for i in range(n_rollouts):
-            rs = (resume_states[i] if i < len(resume_states) else None)
+            rs = resume_states[i] if i < len(resume_states) else None
             if rs and isinstance(rs, dict):
-                steps = list(rs.get("steps", []))
-                steps.sort(key=lambda s: int(s.get("step_idx", 0)))
-                # Drop any steps beyond the current total_steps (handles
-                # re-runs with a smaller depth).
-                steps = [s for s in steps if int(s.get("step_idx", 0)) <= total_steps]
-                all_steps[i] = steps
+                steps = sorted(rs.get("steps", []), key=lambda s: int(s.get("step_idx", 0)))
+                all_steps[i] = [s for s in steps if int(s.get("step_idx", 0)) <= total_steps]
 
-    # How many steps each rollout has already completed.
     n_done = [len(all_steps[i]) for i in range(n_rollouts)]
-
-    # The corrected trace to pass into the next depth for each rollout.
     prior_corrected: List[Optional[str]] = [
         (all_steps[i][-1].get("corrected_trace") if all_steps[i] else None)
         for i in range(n_rollouts)
     ]
 
-    # ── Sequential depth loop — batched across rollouts ───────────────────
     for step_idx in range(1, total_steps + 1):
-        # Only include rollouts that haven't yet reached this depth.
         to_run = [i for i in range(n_rollouts) if n_done[i] < step_idx]
-
         if not to_run:
             logger.debug(
                 f"[CIMR batch] depth {step_idx}: "
                 f"all {n_rollouts} rollouts already complete."
             )
             continue
-
-        prior_for_batch = [prior_corrected[i] for i in to_run]
 
         logger.info(
             f"[CIMR batch] depth {step_idx}/{total_steps}  "
@@ -195,33 +148,27 @@ def run_all_rollouts_batched(
             step_records = run_step_batch(
                 model=model,
                 verifier=verifier,
-                ev=ev,
-                data_name=data_name,
                 question=question,
                 gold_answer=gold_answer,
                 step_idx=step_idx,
                 total_steps=total_steps,
-                prior_corrected_list=prior_for_batch,
+                prior_corrected_list=[prior_corrected[i] for i in to_run],
                 config=config,
                 rollout_idxs=to_run,
             )
         except Exception as e:
-            logger.error(
-                f"[CIMR batch] depth {step_idx} batch failed: {e}",
-                exc_info=True,
-            )
+            logger.error(f"[CIMR batch] depth {step_idx} batch failed: {e}", exc_info=True)
             step_records = [
                 _error_step_record(
-                    rollout_idx=to_run[k],
+                    rollout_idx=i,
                     step_idx=step_idx,
                     total_steps=total_steps,
-                    prior=prior_corrected[to_run[k]],
+                    prior=prior_corrected[i],
                     error=str(e),
                 )
-                for k in range(len(to_run))
+                for i in to_run
             ]
 
-        # ── Update state and fire callbacks ───────────────────────────────
         for record, rollout_i in zip(step_records, to_run):
             all_steps[rollout_i].append(record)
             n_done[rollout_i] = len(all_steps[rollout_i])
@@ -230,12 +177,11 @@ def run_all_rollouts_batched(
             )
 
             if on_rollout_step_complete is not None:
-                is_complete = (n_done[rollout_i] >= total_steps)
                 running = _build_rollout_record(
                     rollout_idx=rollout_i,
                     total_steps=total_steps,
                     steps=all_steps[rollout_i],
-                    completed=is_complete,
+                    completed=(n_done[rollout_i] >= total_steps),
                     elapsed_sec=time.time() - t0,
                 )
                 try:
@@ -246,7 +192,6 @@ def run_all_rollouts_batched(
                         f"(rollout {rollout_i}, depth {step_idx}): {cb_err}"
                     )
 
-    # ── Build and return final rollout records ────────────────────────────
     total_elapsed = time.time() - t0
     return [
         _build_rollout_record(
@@ -260,97 +205,4 @@ def run_all_rollouts_batched(
     ]
 
 
-# =============================================================================
-# Single-rollout sequential entry point (for compat / debugging)
-# =============================================================================
-
-def run_one_rollout(
-    *,
-    model,
-    verifier,
-    ev,
-    data_name: str,
-    question: str,
-    gold_answer: Optional[str],
-    rollout_idx: int,
-    total_steps: int,
-    config: CIMRStepConfig,
-    on_step_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
-    resume_state: Optional[Dict[str, Any]] = None,
-    # Legacy params accepted but ignored:
-    sibling_answers_provider: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """Run one rollout sequentially across d depth steps.
-
-    For new experiments prefer ``run_all_rollouts_batched`` which processes
-    N rollouts in parallel.  This function is kept for debugging and
-    single-rollout compatibility.
-    """
-    t0 = time.time()
-
-    if resume_state and isinstance(resume_state, dict):
-        steps: List[Dict[str, Any]] = list(resume_state.get("steps", []))
-        steps.sort(key=lambda s: int(s.get("step_idx", 0)))
-        steps = [s for s in steps if int(s.get("step_idx", 0)) <= total_steps]
-    else:
-        steps = []
-
-    next_step_idx = (steps[-1]["step_idx"] + 1) if steps else 1
-    prior_corrected: Optional[str] = (
-        steps[-1].get("corrected_trace", "") if steps else None
-    )
-
-    for step_idx in range(next_step_idx, total_steps + 1):
-        try:
-            step_record = run_one_step(
-                model=model,
-                verifier=verifier,
-                ev=ev,
-                data_name=data_name,
-                question=question,
-                gold_answer=gold_answer,
-                step_idx=step_idx,
-                total_steps=total_steps,
-                prior_corrected=prior_corrected,
-                config=config,
-                rollout_idx=rollout_idx,
-            )
-        except Exception as e:
-            logger.error(f"[CIMR rollout {rollout_idx}] step {step_idx} failed: {e}")
-            step_record = _error_step_record(
-                rollout_idx, step_idx, total_steps, prior_corrected, str(e)
-            )
-
-        steps.append(step_record)
-        prior_corrected = step_record.get("corrected_trace", "") or prior_corrected
-
-        if on_step_complete is not None:
-            running = _build_rollout_record(
-                rollout_idx=rollout_idx,
-                total_steps=total_steps,
-                steps=steps,
-                completed=(step_idx >= total_steps),
-                elapsed_sec=time.time() - t0,
-            )
-            try:
-                on_step_complete(running)
-            except Exception as e:
-                logger.warning(
-                    f"[CIMR rollout {rollout_idx}] on_step_complete "
-                    f"failed at step {step_idx}: {e}"
-                )
-
-    return _build_rollout_record(
-        rollout_idx=rollout_idx,
-        total_steps=total_steps,
-        steps=steps,
-        completed=True,
-        elapsed_sec=time.time() - t0,
-    )
-
-
-__all__ = [
-    "run_all_rollouts_batched",
-    "run_one_rollout",
-    "_build_rollout_record",
-]
+__all__ = ["run_all_rollouts_batched"]
